@@ -1,3 +1,3 @@
-# CS271_HW2
+# CS271_HW3
 Henry Zhang
 Ian Wu
