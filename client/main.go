@@ -56,15 +56,7 @@ func serverInit() {
 	myInfo.CurrentLeader = ""
 	myInfo.VotesReceived = []string{}
 
-	server, err := net.Listen(SERVER_TYPE, SERVER_HOST+":"+port)
-	if err != nil {
-		fmt.Println("Error starting server:", err.Error())
-
-		os.Exit(1)
-	}
-
-	defer server.Close()
-	fmt.Println("Listening on " + SERVER_HOST + ":" + port)
+	go startServer()
 
 	// wait for all clients to be set up
 	fmt.Println("Press \"enter\" AFTER all clients' servers are set up to connect to them")
@@ -112,6 +104,20 @@ func serverInit() {
 		}
 	}
 
+}
+
+func startServer() {
+
+	server, err := net.Listen(SERVER_TYPE, SERVER_HOST+":"+port)
+	if err != nil {
+		fmt.Println("Error starting server:", err.Error())
+
+		os.Exit(1)
+	}
+
+	defer server.Close()
+	fmt.Println("Listening on " + SERVER_HOST + ":" + port)
+
 	for {
 		// inbound connection
 		inboundChannel, err := server.Accept()
@@ -129,10 +135,10 @@ func serverInit() {
 		go processInboundChannel(inboundChannel, nameSlice[0])
 
 	}
-
 }
 
 func processInboundChannel(connection net.Conn, clientName string) {
+	// TODO
 }
 
 // connecting to server
