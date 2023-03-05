@@ -5,6 +5,9 @@ import (
 	"net"
 	"os"
 	"strings"
+	// "errors"
+	// "io"
+	// "sync"
 
 	"bufio"
 	"math/rand"
@@ -16,11 +19,6 @@ const (
 	SERVER_HOST = "localhost"
 	SERVER_TYPE = "tcp"
 
-	// A = "7000"
-	// B = "7001"
-	// C = "7002"
-	// D = "7003"
-	// E = "7004"
 	A = "6000"
 	B = "6001"
 	C = "6002"
