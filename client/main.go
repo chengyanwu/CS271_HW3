@@ -50,7 +50,7 @@ func main() {
 	go myInfo.RAFT()
 	// go myInfo.FSM()
 	
-	go takeUserInput()
+	takeUserInput()
 }
 
 // init server with default configuration and connect to other servers

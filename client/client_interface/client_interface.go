@@ -169,7 +169,7 @@ func (c *ClientInfo) RAFT() {
 	//}
 }
 
-// do all the setup work before starting RAFT (public/private keys)
+// Do all the setup work before starting RAFT (public/private keys)
 func (c *ClientInfo) init() {
 
 }
@@ -183,6 +183,8 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 		
 		if err != nil {
 			c.ConnLogger.Printf("Inbound connection from client %s has disconnected\n", clientName)
+			// TODO: handle disconnect ... (don't change leader but modify the outgoing connections and break out of loop)
+			break
 		}
 
 		// parse command identification
