@@ -5,12 +5,13 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
+	"log"
+
 	// "errors"
 	// "io"
-	// "sync"
-
+	"sync"
 	"bufio"
-	"math/rand"
 
 	client "example/users/client/client_interface"
 )
@@ -28,13 +29,14 @@ const (
 
 var myInfo client.ClientInfo
 var port string
-var generator = rand.NewSource(myInfo.ProcessId)
-var r = rand.New(generator)
-var serverList = []string{A, B, C, D, E}
+var processId int64
+var clientInfoMu sync.Mutex
+var leaderInfoMutex sync.Mutex
 
 func main() {
-	processId := int64(os.Getpid())
+	processId = int64(os.Getpid())
 	fmt.Println("My process ID:", processId)
+	
 	myInfo.ProcessId = processId
 
 	if len(os.Args) != 2 {
@@ -43,115 +45,143 @@ func main() {
 	}
 
 	serverInit()
+
+	// start running raft 
+	// go myInfo.RAFT()
+	// go myInfo.FSM() 
+	takeUserInput()
 }
 
 // init server with default configuration and connect to other servers
 func serverInit() {
-	myInfo.ClientName = os.Args[1]
-	myInfo.CurrentTerm = 0
-	myInfo.VotedFor = ""
-	myInfo.CurrentRole = client.FOLLOWER
-	myInfo.CurrentLeader = ""
-	myInfo.VotesReceived = []string{}
-
-	go startServer()
-
-	// wait for all clients to be set up
-	fmt.Println("Press \"enter\" AFTER all clients' servers are set up to connect to them")
-	fmt.Scanln()
+	myInfo.NewRaft(processId, os.Args[1], &clientInfoMu, &leaderInfoMutex)
 
 	if myInfo.ClientName == "A" {
 		port = A
-		myInfo.Conns = []client.ConnectionInfo{
-			{ClientName: "A", Connection: establishConnection(B)},
-			{ClientName: "B", Connection: establishConnection(C)},
-			{ClientName: "C", Connection: establishConnection(D)},
-			{ClientName: "D", Connection: establishConnection(E)},
-		}
 	} else if myInfo.ClientName == "B" {
 		port = B
-		myInfo.Conns = []client.ConnectionInfo{
-			{ClientName: "A", Connection: establishConnection(B)},
-			{ClientName: "C", Connection: establishConnection(C)},
-			{ClientName: "D", Connection: establishConnection(D)},
-			{ClientName: "E", Connection: establishConnection(E)},
-		}
 	} else if myInfo.ClientName == "C" {
 		port = C
-		myInfo.Conns = []client.ConnectionInfo{
-			{ClientName: "A", Connection: establishConnection(B)},
-			{ClientName: "B", Connection: establishConnection(C)},
-			{ClientName: "D", Connection: establishConnection(D)},
-			{ClientName: "E", Connection: establishConnection(E)},
-		}
 	} else if myInfo.ClientName == "D" {
 		port = D
-		myInfo.Conns = []client.ConnectionInfo{
-			{ClientName: "A", Connection: establishConnection(B)},
-			{ClientName: "B", Connection: establishConnection(C)},
-			{ClientName: "C", Connection: establishConnection(D)},
-			{ClientName: "E", Connection: establishConnection(E)},
-		}
-	} else if myInfo.ClientName == "E" {
+	} else {
 		port = E
-		myInfo.Conns = []client.ConnectionInfo{
-			{ClientName: "A", Connection: establishConnection(B)},
-			{ClientName: "B", Connection: establishConnection(C)},
-			{ClientName: "C", Connection: establishConnection(D)},
-			{ClientName: "D", Connection: establishConnection(E)},
-		}
 	}
 
+	go startServer(port, myInfo.ClientName) // listen to incoming connections and connect to them!
+
+	// wait for all clients to be set up, then connect to them
+	// fmt.Println("Press \"enter\" AFTER all clients' servers are set up to connect to them")
+	// fmt.Scanln()
+
+	myInfo.Mu.Lock()
+	if myInfo.ClientName == "A" {
+		myInfo.OutboundConns["B"] = establishConnection(B)
+		myInfo.OutboundConns["C"] = establishConnection(C)	
+		myInfo.OutboundConns["D"] = establishConnection(D)
+		myInfo.OutboundConns["E"] = establishConnection(E)
+	} else if myInfo.ClientName == "B" {
+		myInfo.OutboundConns["A"] = establishConnection(A)
+		myInfo.OutboundConns["C"] = establishConnection(C)
+		myInfo.OutboundConns["D"] = establishConnection(D)
+		myInfo.OutboundConns["E"] = establishConnection(E)
+	} else if myInfo.ClientName == "C" {
+		myInfo.OutboundConns["A"] = establishConnection(A)
+		myInfo.OutboundConns["B"] = establishConnection(B)
+		myInfo.OutboundConns["D"] = establishConnection(D)
+		myInfo.OutboundConns["E"] = establishConnection(E)
+	} else if myInfo.ClientName == "D" {
+		myInfo.OutboundConns["A"] = establishConnection(A)
+		myInfo.OutboundConns["B"] = establishConnection(B)
+		myInfo.OutboundConns["C"] = establishConnection(C)
+		myInfo.OutboundConns["E"] = establishConnection(E)
+	} else if myInfo.ClientName == "E" {
+		myInfo.OutboundConns["A"] = establishConnection(A)
+		myInfo.OutboundConns["B"] = establishConnection(B)
+		myInfo.OutboundConns["C"] = establishConnection(C)
+		myInfo.OutboundConns["D"] = establishConnection(D)
+	}
+	myInfo.Mu.Unlock()
+
+	fmt.Println("Press \"enter\" AFTER all connections are established to begin RAFT elections!")
+	fmt.Scanln()	
 }
 
-func startServer() {
-
+func startServer(port, name string) {
 	server, err := net.Listen(SERVER_TYPE, SERVER_HOST+":"+port)
-	if err != nil {
-		fmt.Println("Error starting server:", err.Error())
 
-		os.Exit(1)
+	if err != nil {
+		log.Fatalf("Error starting server: %s\n", err.Error())
+		// fmt.Fprintf(os.Stderr, "Error starting server: %s\n", err.Error())
+
+		// os.Exit(1)
 	}
 
 	defer server.Close()
 	fmt.Println("Listening on " + SERVER_HOST + ":" + port)
 
 	for {
-		// inbound connection
-		inboundChannel, err := server.Accept()
-		handleError(err, "Error accepting client.", inboundChannel)
+		// Listen for inbound connection
+		inboundConn, err := server.Accept()
+		handleError(err, "Error accepting client.", inboundConn)
 
-		// PROTOCOL: broadcast self name to connection
-		writeToConnection(inboundChannel, myInfo.ClientName+"\n")
+		// PROTOCOL: write [self name]
+		writeToConnection(inboundConn, name+"\n")
 
-		// PROTOCOL: receive inbound client name
-		clientName, err := bufio.NewReader(inboundChannel).ReadBytes('\n')
-		handleError(err, "Didn't receive connected client's name.", inboundChannel)
+		// PROTOCOL: receive [incoming client name, client port number]
+		clientName, err := bufio.NewReader(inboundConn).ReadBytes('\n')
+		handleError(err, "Didn't receive connected client's name.", inboundConn)
 
 		nameSlice := strings.Split(string(clientName[:len(clientName)-1]), ":")
 
-		go processInboundChannel(inboundChannel, nameSlice[0])
-
+		go setupInboundChannel(inboundConn, nameSlice[0], nameSlice[1])
 	}
 }
 
-func processInboundChannel(connection net.Conn, clientName string) {
-	// TODO
+// Add incoming connection to map and establish outbound connection if doesn't yet exist.
+func setupInboundChannel(connection net.Conn, clientName string, clientPort string) {
+	fmt.Printf("Inbound client %s connected\n", clientName)
+	myInfo.Mu.Lock()
+	myInfo.InboundConns[clientName] = connection
+	myInfo.Mu.Unlock()
+
+	// set up outbound connection
+	if myInfo.OutboundConns[clientName] == nil {
+		connection, err := net.Dial(SERVER_TYPE, SERVER_HOST+":"+clientPort)
+		handleError(err, fmt.Sprintf("Failed to RESPONSE connect to client with name: %s\n", clientName), connection)
+
+		_, err = bufio.NewReader(connection).ReadBytes('\n')
+		handleError(err, fmt.Sprintf("Didn't receive client's response on port: %s\n", clientPort), connection)
+		fmt.Println("Successfully established outbound channel to client with name:", clientName)
+
+		writeToConnection(connection, myInfo.ClientName+":"+port+"\n")
+		
+		myInfo.Mu.Lock()
+		myInfo.OutboundConns[clientName] = connection
+		myInfo.Mu.Unlock()
+	}
 }
 
-// connecting to server
-func establishConnection(serverPort string) net.Conn {
-	connection, err := net.Dial(SERVER_TYPE, SERVER_HOST+":"+serverPort)
+// Establish outbound connection to the specific port
+func establishConnection(clientPort string) net.Conn {
+	connection, err := net.Dial(SERVER_TYPE, SERVER_HOST+":"+clientPort)
 
-	defer connection.Close()
+	if err != nil {
+		return nil
+	}
 
-	handleError(err, fmt.Sprintf("Couldn't connect to client's server with port: %s\n", port), connection)
+	// PROTOCOL: receive [client name]
+	clientName, err := bufio.NewReader(connection).ReadBytes('\n')
+	handleError(err, fmt.Sprintf("Didn't receive client's response on port: %s\n", clientPort), connection)
+	fmt.Println("Successfully established outbound channel to client with name:", string(clientName[:len(clientName) - 1]))
+	
+	// PROTOCOL: send self name and port number to connection
+	writeToConnection(connection, myInfo.ClientName+":"+port+"\n")
 
 	return connection
 }
 
 func takeUserInput() {
-	fmt.Println("All outbound connections established")
 	var action string
 
 	fmt.Println("===== Actions =====\np - print client info\n===================")
@@ -161,7 +191,7 @@ func takeUserInput() {
 		if err != nil {
 			fmt.Println("Error occurred when scanning input")
 		} else if action == "p" {
-			fmt.Println(myInfo)
+			fmt.Println(&myInfo)
 		} else if action == "s" {
 			// TODO: Ian
 		} else {
@@ -180,7 +210,7 @@ func handleError(err error, message string, connection net.Conn) {
 }
 
 func writeToConnection(connection net.Conn, message string) {
-	// time.Sleep(3 * time.Second)
+	time.Sleep(3 * time.Second)
 	_, err := connection.Write([]byte(message))
 
 	handleError(err, "Error writing.", connection)
