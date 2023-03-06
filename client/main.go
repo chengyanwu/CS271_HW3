@@ -47,9 +47,10 @@ func main() {
 	serverInit()
 
 	// start running raft 
-	// go myInfo.RAFT()
-	// go myInfo.FSM() 
-	takeUserInput()
+	go myInfo.RAFT()
+	// go myInfo.FSM()
+	
+	go takeUserInput()
 }
 
 // init server with default configuration and connect to other servers
@@ -74,34 +75,32 @@ func serverInit() {
 	// fmt.Println("Press \"enter\" AFTER all clients' servers are set up to connect to them")
 	// fmt.Scanln()
 
-	myInfo.Mu.Lock()
 	if myInfo.ClientName == "A" {
-		myInfo.OutboundConns["B"] = establishConnection(B)
-		myInfo.OutboundConns["C"] = establishConnection(C)	
-		myInfo.OutboundConns["D"] = establishConnection(D)
-		myInfo.OutboundConns["E"] = establishConnection(E)
+		myInfo.OutboundConns.Set("B", establishConnection(B))
+		myInfo.OutboundConns.Set("C", establishConnection(C))
+		myInfo.OutboundConns.Set("D", establishConnection(D))
+		myInfo.OutboundConns.Set("E", establishConnection(E))
 	} else if myInfo.ClientName == "B" {
-		myInfo.OutboundConns["A"] = establishConnection(A)
-		myInfo.OutboundConns["C"] = establishConnection(C)
-		myInfo.OutboundConns["D"] = establishConnection(D)
-		myInfo.OutboundConns["E"] = establishConnection(E)
+		myInfo.OutboundConns.Set("A", establishConnection(A))
+		myInfo.OutboundConns.Set("C", establishConnection(C))
+		myInfo.OutboundConns.Set("D", establishConnection(D))
+		myInfo.OutboundConns.Set("E", establishConnection(E))
 	} else if myInfo.ClientName == "C" {
-		myInfo.OutboundConns["A"] = establishConnection(A)
-		myInfo.OutboundConns["B"] = establishConnection(B)
-		myInfo.OutboundConns["D"] = establishConnection(D)
-		myInfo.OutboundConns["E"] = establishConnection(E)
+		myInfo.OutboundConns.Set("A", establishConnection(A))
+		myInfo.OutboundConns.Set("B", establishConnection(B))
+		myInfo.OutboundConns.Set("D", establishConnection(D))
+		myInfo.OutboundConns.Set("E", establishConnection(E))
 	} else if myInfo.ClientName == "D" {
-		myInfo.OutboundConns["A"] = establishConnection(A)
-		myInfo.OutboundConns["B"] = establishConnection(B)
-		myInfo.OutboundConns["C"] = establishConnection(C)
-		myInfo.OutboundConns["E"] = establishConnection(E)
+		myInfo.OutboundConns.Set("A", establishConnection(A))
+		myInfo.OutboundConns.Set("B", establishConnection(B))
+		myInfo.OutboundConns.Set("C", establishConnection(C))
+		myInfo.OutboundConns.Set("E", establishConnection(E))
 	} else if myInfo.ClientName == "E" {
-		myInfo.OutboundConns["A"] = establishConnection(A)
-		myInfo.OutboundConns["B"] = establishConnection(B)
-		myInfo.OutboundConns["C"] = establishConnection(C)
-		myInfo.OutboundConns["D"] = establishConnection(D)
+		myInfo.OutboundConns.Set("A", establishConnection(A))
+		myInfo.OutboundConns.Set("B", establishConnection(B))
+		myInfo.OutboundConns.Set("C", establishConnection(C))
+		myInfo.OutboundConns.Set("D", establishConnection(D))
 	}
-	myInfo.Mu.Unlock()
 
 	fmt.Println("Press \"enter\" AFTER all connections are established to begin RAFT elections!")
 	fmt.Scanln()	
@@ -140,13 +139,12 @@ func startServer(port, name string) {
 
 // Add incoming connection to map and establish outbound connection if doesn't yet exist.
 func setupInboundChannel(connection net.Conn, clientName string, clientPort string) {
-	fmt.Printf("Inbound client %s connected\n", clientName)
-	myInfo.Mu.Lock()
-	myInfo.InboundConns[clientName] = connection
-	myInfo.Mu.Unlock()
+	// fmt.Printf("Inbound client %s connected\n", clientName)
+	myInfo.InboundConns.Set(clientName, connection)
+	myInfo.Listen(connection, clientName) // start receiving messages on the inbound connection
 
 	// set up outbound connection
-	if myInfo.OutboundConns[clientName] == nil {
+	if value, exists := myInfo.OutboundConns.Get(clientName); exists && value == nil {
 		connection, err := net.Dial(SERVER_TYPE, SERVER_HOST+":"+clientPort)
 		handleError(err, fmt.Sprintf("Failed to RESPONSE connect to client with name: %s\n", clientName), connection)
 
@@ -156,9 +154,7 @@ func setupInboundChannel(connection net.Conn, clientName string, clientPort stri
 
 		writeToConnection(connection, myInfo.ClientName+":"+port+"\n")
 		
-		myInfo.Mu.Lock()
-		myInfo.OutboundConns[clientName] = connection
-		myInfo.Mu.Unlock()
+		myInfo.OutboundConns.Set(clientName, connection)
 	}
 }
 
