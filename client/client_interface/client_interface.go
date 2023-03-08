@@ -43,7 +43,7 @@ const (
 )
 
 const (
-	DELIM = ":"
+	DELIM = "*"
 	TIMEOUT = 7
 )
 
@@ -67,8 +67,9 @@ type ClientInfo struct {
 	ClientName    string              // name identifier: A, B, C, D, E
 	OutboundConns storage.ConnStorage // outbound connections to other servers
 	InboundConns  storage.ConnStorage // inbound connections from other servers
-	CurrentTerm   int
-	CurrentIndex  int
+	CurrentTerm   int                 // current leader term
+	LastLogIndex  int				  // index of latest entry in the log
+	LastLogTerm   int				  // term of the latest entry in the log
 	ReplicatedLog []LogEntry          // log entries, read from the disk
 	VotedFor      string              // name of client voted for leader
 	CurrentRole   Role                // 1: follower / 2: leader / 3: candidate
@@ -89,6 +90,9 @@ type ClientInfo struct {
 	// Communication channels for RPC
 	ReqVoteRequestChan  chan RequestVoteRequest
 	ReqVoteResponseChan chan RequestVoteResponse
+
+	// Random number generator
+	r             *rand.Rand
 }
 
 type LogEntry struct {
@@ -200,7 +204,8 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.OutboundConns = storage.NewConnStorage()
 	c.InboundConns = storage.NewConnStorage()
 	c.CurrentTerm = 0
-	c.CurrentIndex = 0
+	c.LastLogIndex = -1
+	c.LastLogTerm = 0
 	c.ReplicatedLog = make([]LogEntry, 0)
 	c.VotedFor = ""
 	c.CurrentRole = FOLLOWER
@@ -217,6 +222,10 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 
 	c.ReqVoteRequestChan = make(chan RequestVoteRequest)
 	c.ReqVoteResponseChan = make(chan RequestVoteResponse)
+
+	// set up RNG
+	generator := rand.NewSource(processID)
+	c.r = rand.New(generator)
 }
 
 // Recover client information after crashing
@@ -242,7 +251,7 @@ func (c *ClientInfo) RAFT() {
 			c.follower()
 		case CANDIDATE:
 			c.candidate()
-		case LEADER: 
+		case LEADER:
 			// c.leader()
 		}
 	}
@@ -251,7 +260,7 @@ func (c *ClientInfo) RAFT() {
 func (c *ClientInfo) follower() {
 	c.ElecLogger.Printf("State: FOLLOWER\n")
 	// start election timer, reset election timeout
-	timer, duration := newElectionTimer(TIMEOUT * time.Second)
+	timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
 	c.LastContact = time.Now()
 
 	c.Mu.Lock()
@@ -260,26 +269,27 @@ func (c *ClientInfo) follower() {
 
 	c.ElecLogger.Printf("Election timeout started with duration %v, term=%d\n", duration, currentTerm)
 
-	c.Mu.Lock()
 	for c.getRole() == FOLLOWER {
+		// fmt.Println("???")
 		select {
 		case <-timer:
 			c.ElecLogger.Printf("Election timeout ended, checking if heartbeat received from leader\n")
 
 			// check for timeout
 			if time.Since(c.LastContact) < duration {
-				timer, duration = newElectionTimer(TIMEOUT * time.Second)
+				timer, duration = newElectionTimer(c.r, TIMEOUT * time.Second)
 				c.ElecLogger.Printf("Heartbeat received, new election timer started with duration %v, term=%d\n", duration, currentTerm)
 				continue
 			} else {
 				c.ElecLogger.Printf("Heartbeat wasn't received on term=%d, promoting self to CANDIDATE\n", currentTerm)
 				c.CurrentLeader.clearLeader() 
-				c.CurrentRole = CANDIDATE
+				c.setRole(CANDIDATE)
 				// c.Mu.Unlock()
 			}
+		case <- c.ReqVoteRequestChan:
+			c.ElecLogger.Printf("Bruh i don't give a fuck\n")
 		}
 	}
-	c.Mu.Unlock()
 }
 
 func (c *ClientInfo) candidate() {
@@ -291,7 +301,7 @@ func (c *ClientInfo) candidate() {
 	c.ElecLogger.Printf("Beginning new election with term %d\n", c.CurrentTerm)
 	c.Mu.Unlock()
 
-	timer, duration := newElectionTimer(TIMEOUT * time.Second)
+	timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
 	c.LastContact = time.Now()
 	c.ElecLogger.Printf("Election timeout started with duration %v, term=%d\n", duration, tmpTerm)
 
@@ -300,25 +310,56 @@ func (c *ClientInfo) candidate() {
 	for c.getRole() == CANDIDATE {
 		select {
 		case <- timer:
-			c.ElecLogger.Printf("Election timeout ended, checking if election has been decided")
+			c.ElecLogger.Printf("Election timeout ended, checking if election has been decided\n")
+		// TODO: process data
+		case <- c.ReqVoteRequestChan:
+			c.ElecLogger.Printf("Bruh i don't give a fuck\n")
 		}
 	}
 }
 
 func (c *ClientInfo) leader() {
-
+	
 }
 
-// start election function
+// Start election after becoming a CANDIDATE
 func (c *ClientInfo) startElection(term int) {
 	// vote for ourself
+	c.Mu.Lock()
 	c.VotedFor = c.ClientName
 	c.VotesReceived = append(c.VotesReceived, c.ClientName)
-	
-	// send RequestVote RPC to outbound connections - hold mutex lock here
-	for {
-		// HENRY TODO
+	c.Mu.Unlock()
+
+	// fmt.Println("before check range out keys")
+	// send RequestVote RPC to outbound connections
+	for _, clientName := range c.OutboundConns.Keys() {
+		conn, exists := c.OutboundConns.Get(clientName)
+
+		if exists {
+			go func(connection net.Conn, clientName string){
+				c.ElecLogger.Printf("Sending RequestVote RPC to client: %s", clientName)
+
+				c.Mu.Lock()
+				requestData := RequestVoteRequest {
+					CandidateName: c.ClientName,
+					CandidateTerm: term,
+					LastLogIndex: c.LastLogIndex,
+					LastLogTerm: c.LastLogTerm,
+				}
+
+				c.Mu.Unlock()
+
+				message := []byte(string(strconv.Itoa(int(REQUESTVOTE_REQ)) + DELIM))
+				// fmt.Println(string(strconv.Itoa(int(REQUESTVOTE_REQ)) + DELIM)
+				message = append(message, requestData.Marshal()...)
+				message = append(message, byte('@'))
+				c.writeToConnection(c.ClientName, connection, message, fmt.Sprintf("RequestVote RPC with data: %+v", requestData))
+
+			}(conn, clientName)
+		}
 	}
+
+	// fmt.Println("After checking.")
 }
 
 func (c *ClientInfo) getRole() Role {
@@ -327,6 +368,12 @@ func (c *ClientInfo) getRole() Role {
 	c.Mu.Unlock()
 
 	return state
+}
+
+func (c *ClientInfo) setRole(newRole Role) {
+	c.Mu.Lock()
+	c.CurrentRole = newRole
+	c.Mu.Unlock()
 }
 
 // TODO: Do all the setup work before starting RAFT (public/private keys)
@@ -339,7 +386,7 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 	reader := bufio.NewReader(connection)
 	for {
 		// TODO: receive incoming messages, identify the message type, demarshal into the appropriate data structure, and pass the struct to the appropriate channel for RAFT to handle
-		bytes, err := reader.ReadBytes('\n')
+		bytes, err := reader.ReadBytes('@')
 		
 		if err != nil {
 			c.ConnLogger.Printf("Inbound connection from client %s has disconnected\n", clientName)
@@ -348,35 +395,64 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 		}
 
 		// parse command identification
-		id := strings.Split(string(bytes[:len(bytes) - 1]), DELIM)[0]
-		c.ConnLogger.Printf("Received command [%s] from %s\n", strings.ToUpper(id), clientName)
+		parse := strings.Split(string(bytes[:len(bytes) - 1]), DELIM)
+		id := parse[0]
+		data := parse[1] // must remove newline later
+
+		c.ConnLogger.Printf("Received command [%s] from %s with data [%s]\n", strings.ToUpper(id), clientName, data)
 		
 		idInt, _ := strconv.Atoi(id)
-		c.reqChan(Rpc(idInt), bytes)
+		c.reqChan(Rpc(idInt), []byte(data[:len(data) - 1]))
 	}
 }
 
 func (c *ClientInfo) reqChan(id Rpc, b []byte) {
+	fmt.Println("Enter")
 	c.Mu.Lock()
+	fmt.Println("Enter past lock")
 	defer c.Mu.Unlock()
 	switch id {
 	// If CANDIDATE, respond to the RequestVote result. Otherwise, ignore the request
 	case REQUESTVOTE_REPLY:
-	var data RequestVoteResponse
-	if c.CurrentRole == CANDIDATE {
-		data.Demarshal(b)
-		c.ReqVoteResponseChan <- data
-	}
+		// fmt.Println("Enter past use case")
+		var data RequestVoteResponse
+		if c.CurrentRole == CANDIDATE {
+			data.Demarshal(b)
+			c.ReqVoteResponseChan <- data
+		}
+		// fmt.Println("Enter past demarshal")
 	// All roles must respond to the RequestVote request
 	case REQUESTVOTE_REQ:
-	var data RequestVoteRequest
-	data.Demarshal(b)
-	c.ReqVoteRequestChan <- data
+		fmt.Println("Enter past use case")
+		var data RequestVoteRequest
+		data.Demarshal(b)
+		fmt.Println("Enter past demarshal")
+		c.ReqVoteRequestChan <- data
+		fmt.Println("Enter past chan")
 	}
+	fmt.Println("Leave")
 }
 
 // if minTime = 5, election timer lasts between 5 and 10 seconds
-func newElectionTimer(minTime time.Duration) (<-chan time.Time, time.Duration) {
+func newElectionTimer(rand *rand.Rand, minTime time.Duration) (<-chan time.Time, time.Duration) {
 	extra := time.Duration(rand.Int63()) % minTime
 	return time.After(minTime + extra), minTime + extra
+}
+
+// Write a message to the passed connection object
+func (c *ClientInfo) writeToConnection(clientName string, connection net.Conn, message []byte, errMessage string) {
+	time.Sleep(3 * time.Second)
+	_, err := connection.Write(message)
+
+	c.handleWriteError(err, errMessage, connection, clientName)
+}
+
+// Process write error [incomplete]
+func (c *ClientInfo) handleWriteError(err error, errMessage string, connection net.Conn, clientName string) {
+	if err != nil {
+		c.ConnLogger.Printf("err=%s, client=%s, [INFO: %s]\n", err.Error(), clientName, errMessage)
+		connection.Close()
+
+		c.OutboundConns.Set(clientName, nil)
+	}
 }

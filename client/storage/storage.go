@@ -21,6 +21,11 @@ func (ms *ConnStorage) Get(key string) (net.Conn, bool) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	v, found := ms.m[key]
+
+	// if found && v == nil {
+		// found = false
+	// }
+
 	return v, found
 }
 
@@ -36,13 +41,18 @@ func (ms *ConnStorage) Length() int {
 	return len(ms.m)
 }
 
+// Retrieves the keys from the store that have non-nil connections
 func (ms *ConnStorage) Keys() []string {
+	// fmt.Println("IN keys")
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	keys := make([]string, 0, ms.Length())
+	keys := make([]string, 0, len(ms.m))
     for key := range ms.m {
-        keys = append(keys, key)
+		// fmt.Println("Deep in keys")
+		if ms.m[key] != nil {
+       		keys = append(keys, key)
+		}
     }
-
+	// fmt.Println("out keys")
 	return keys
 }

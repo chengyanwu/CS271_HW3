@@ -5,8 +5,8 @@ import (
 	"net"
 	"os"
 	"strings"
-	"time"
 	"log"
+	// "time"
 
 	// "errors"
 	// "io"
@@ -206,7 +206,7 @@ func handleError(err error, message string, connection net.Conn) {
 }
 
 func writeToConnection(connection net.Conn, message string) {
-	time.Sleep(3 * time.Second)
+	// time.Sleep(1 * time.Second)
 	_, err := connection.Write([]byte(message))
 
 	handleError(err, "Error writing.", connection)
