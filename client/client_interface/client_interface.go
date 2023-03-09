@@ -1,21 +1,21 @@
 package client
 
 import (
-	"fmt"
-	"net"
-	"sync"
-	"log"
-	"os"
 	"bufio"
-	"strings"
-	"time"
-	"math/rand"
 	"encoding/json"
+	"fmt"
+	"log"
+	"math/rand"
+	"net"
+	"os"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-	storage "example/users/client/storage"
-	disk   "example/users/client/disk"
 	crypto "example/users/client/crypto"
+	disk "example/users/client/disk"
+	storage "example/users/client/storage"
 )
 
 type Role uint8
@@ -45,6 +45,8 @@ const (
 const (
 	DELIM = "*"
 	TIMEOUT = 7
+	MAJORITY = 3
+	MSG_DELIM = '@'
 )
 
 // implement ToString
@@ -85,20 +87,23 @@ type ClientInfo struct {
 	ElecLogger    *log.Logger		  // logs information about Election RPCs and leader changes
 	ConnLogger    *log.Logger         // logs information about outgoing and ingoing messages on connections, and connection disconnects
 
-	LastContact   time.Time           // tracks last contact with the leader
+	// LastContact   time.Time           // tracks last contact with the leader
 
 	// Communication channels for RPC
-	ReqVoteRequestChan  chan RequestVoteRequest
-	ReqVoteResponseChan chan RequestVoteResponse
+	ReqVoteRequestChan      chan RequestVoteRequest
+	ReqVoteResponseChan     chan RequestVoteResponse
+	AppendEntryRequestChan  chan AppendEntryRequest
+	AppendEntryResponseChan chan AppendEntryResponse
 
 	// Random number generator
 	r             *rand.Rand
 }
 
 type LogEntry struct {
-	Index int
-	Term  int
-	Command Command
+	Index     int
+	Term      int
+	Committed bool
+	Command   Command
 }
 
 type Command struct {
@@ -151,6 +156,7 @@ func (r *RequestVoteRequest) Demarshal(b []byte) {
 type RequestVoteResponse struct {
 	NewTerm     int
 	VoteGranted bool
+	ClientName  string
 }
 
 func (r *RequestVoteResponse) Marshal() []byte {
@@ -167,6 +173,48 @@ func (r *RequestVoteResponse) Demarshal(b []byte) {
 	json.Unmarshal(b, r)
 }
 
+type AppendEntryRequest struct {
+	Term         int
+	LeaderName   string
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	CommitIndex  int
+}
+
+func (a *AppendEntryRequest) Marshal() []byte {
+	bytes, err := json.Marshal(a)
+
+	if err != nil {
+		panic(fmt.Sprintf("Failed to marshal AppndEntryRequest struct: %v\n", *a))
+	}
+
+	return bytes
+}
+
+func (a *AppendEntryRequest) Demarshal(b []byte) {
+	json.Unmarshal(b, a)
+}
+
+type AppendEntryResponse struct {
+	NewTerm int  // term of self, may be higher than the LEADER who sent the AE RPC
+	Success bool // true of previous entries of FOLLOWER were all committed
+}
+
+func (a *AppendEntryResponse) Marshal() []byte {
+	bytes, err := json.Marshal(a)
+
+	if err != nil {
+		panic(fmt.Sprintf("Failed to marshal AppendEntryResponse struct: %v\n", *a))
+	}
+
+	return bytes
+}
+
+func (a *AppendEntryResponse) Demarshal(b []byte) {
+	json.Unmarshal(b, a)
+}
+
 // Check if current client is the leader
 func (c *ClientInfo) CheckSelf() bool {
 	return c.CurrentLeader.ClientName == c.ClientName
@@ -179,6 +227,14 @@ func (l *LeaderInfo) clearLeader() {
 	l.ClientName = ""
 	l.InboundConnection = nil
 	l.OutboundConnection = nil
+}
+
+func (l *LeaderInfo) setLeader(leaderName string, outboundConnection net.Conn) {
+	l.Mu.Lock()
+	defer l.Mu.Unlock()
+	l.NoLeader = false
+	l.ClientName = leaderName
+	l.OutboundConnection = outboundConnection
 }
 
 func (c *ClientInfo) String() string {
@@ -215,13 +271,15 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.LogStore = disk.LogStore{} // TODO
 	c.Faillinks = make(map[string]net.Conn)
 	c.DiskLogger = log.New(os.Stdout, "[FSM]", log.LstdFlags)
-	c.ElecLogger = log.New(os.Stdout, "[ELECTION]", log.LstdFlags)
+	c.ElecLogger = log.New(os.Stdout, "[ELEC/AE]", log.LstdFlags)
 	c.ConnLogger = log.New(os.Stdout, "[CONN]", log.LstdFlags)
-	c.LastContact = time.Now()
+	// c.LastContact = time.Now()
 	c.Keys.New()
 
 	c.ReqVoteRequestChan = make(chan RequestVoteRequest)
 	c.ReqVoteResponseChan = make(chan RequestVoteResponse)
+	c.AppendEntryRequestChan = make(chan AppendEntryRequest)
+	c.AppendEntryResponseChan = make(chan AppendEntryResponse)
 
 	// set up RNG
 	generator := rand.NewSource(processID)
@@ -252,74 +310,209 @@ func (c *ClientInfo) RAFT() {
 		case CANDIDATE:
 			c.candidate()
 		case LEADER:
-			// c.leader()
+			c.leader()
 		}
 	}
+}
+
+func (c *ClientInfo) setupFollower() int {
+	c.Mu.Lock()
+	currentTerm := c.CurrentTerm
+	c.VotedFor = ""
+	c.VotesReceived = make([]string, 0)
+	c.Mu.Unlock()
+
+	return currentTerm
 }
 
 func (c *ClientInfo) follower() {
 	c.ElecLogger.Printf("State: FOLLOWER\n")
 	// start election timer, reset election timeout
 	timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
-	c.LastContact = time.Now()
+	// c.LastContact = time.Now()
 
-	c.Mu.Lock()
-	currentTerm := c.CurrentTerm
-	c.Mu.Unlock()
+	currentTerm := c.setupFollower()
 
 	c.ElecLogger.Printf("Election timeout started with duration %v, term=%d\n", duration, currentTerm)
 
 	for c.getRole() == FOLLOWER {
-		// fmt.Println("???")
 		select {
-		case <-timer:
-			c.ElecLogger.Printf("Election timeout ended, checking if heartbeat received from leader\n")
+		case <- timer:
+			// c.ElecLogger.Printf("Election timeout ended, checking if heartbeat received from leader\n")
 
-			// check for timeout
-			if time.Since(c.LastContact) < duration {
-				timer, duration = newElectionTimer(c.r, TIMEOUT * time.Second)
-				c.ElecLogger.Printf("Heartbeat received, new election timer started with duration %v, term=%d\n", duration, currentTerm)
-				continue
-			} else {
-				c.ElecLogger.Printf("Heartbeat wasn't received on term=%d, promoting self to CANDIDATE\n", currentTerm)
-				c.CurrentLeader.clearLeader() 
-				c.setRole(CANDIDATE)
+			// // check for timeout, if timeout was received, we start
+			// if time.Since(c.LastContact) < duration {
+			// 	timer, duration = newElectionTimer(c.r, TIMEOUT * time.Second)
+			// 	c.ElecLogger.Printf("Heartbeat received, new election timer started with duration %v, term=%d\n", duration, currentTerm)
+			// 	continue
+			// } else {
+			c.ElecLogger.Printf("AppendEntry heartbeat wasn't received before timeout on term=%d, promoting self to CANDIDATE\n", currentTerm)
+			c.setRole(CANDIDATE)
 				// c.Mu.Unlock()
-			}
+			// }
+		// Resets timer only if vote is granted to CANDIDATE
 		case <- c.ReqVoteRequestChan:
 			c.ElecLogger.Printf("Bruh i don't give a fuck\n")
+
+		// Respond to AppendEntry request and reset timer
+		// TODO: Set the leader information (id and connection)
+		case request := <- c.AppendEntryRequestChan:
+			timer, duration = newElectionTimer(c.r, TIMEOUT * time.Second)
+			c.ElecLogger.Printf("AppendEntry request received, election timeout reset with duration %v, term=%d\n", duration, currentTerm)
+
+			var responseData AppendEntryResponse
+			responseData.Success = false
+			conn, _ := c.OutboundConns.Get(request.LeaderName)
+
+			// LEADER term is out of date
+			if request.Term < currentTerm {
+				c.ElecLogger.Printf("LEADER's term=%d is out of date (our term=%d), no action will be taken\n", request.Term, currentTerm)
+				responseData.NewTerm = currentTerm
+			// LEADER term matches our term
+			} else if request.Term == currentTerm {
+				// TODO: after we finish leader election
+				c.ElecLogger.Printf("LEADER's term=%d is same as our term, we love our LEADER <3\n", request.Term)
+				responseData.NewTerm = currentTerm
+				responseData.Success = true
+				
+				c.CurrentLeader.setLeader(request.LeaderName, conn)
+			// LEADER is more up to date than us
+			} else {
+				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, updating our term\n", request.Term, currentTerm)
+				responseData.NewTerm = request.Term
+
+				c.Mu.Lock()
+				c.CurrentTerm = responseData.NewTerm
+				// currentTerm = responseData.NewTerm
+				c.Mu.Unlock()
+
+				currentTerm = c.setupFollower()
+				c.CurrentLeader.setLeader(request.LeaderName, conn)
+			}
+
+			connection := c.CurrentLeader.OutboundConnection
+
+			if connection != nil {
+				c.sendRPC(APPENDENTRIES_REPLY, &responseData, connection, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData))
+			} else {
+				// If failed, we don't have to send it over
+				panic("Connection is broken for AppendEntry RPC response")
+			}
 		}
 	}
 }
 
 func (c *ClientInfo) candidate() {
-	c.ElecLogger.Printf("State: CANDIDATE")
-	// start election
-	c.Mu.Lock()
-	c.CurrentTerm += 1
-	tmpTerm := c.CurrentTerm
-	c.ElecLogger.Printf("Beginning new election with term %d\n", c.CurrentTerm)
-	c.Mu.Unlock()
+	c.ElecLogger.Printf("State: CANDIDATE\n")
+	c.CurrentLeader.clearLeader()
+	// prepare for new election
+	prepareElection := func() (<-chan time.Time, int) {
+		c.Mu.Lock()
+		c.CurrentTerm += 1
+		tmpTerm := c.CurrentTerm
 
-	timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
-	c.LastContact = time.Now()
-	c.ElecLogger.Printf("Election timeout started with duration %v, term=%d\n", duration, tmpTerm)
+		c.ElecLogger.Printf("Beginning new election with term %d\n", c.CurrentTerm)
+		c.Mu.Unlock()
 
+		timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
+		// c.LastContact = time.Now()
+		c.ElecLogger.Printf("Election timeout started with duration %v, term=%d\n", duration, tmpTerm)
+
+		return timer, tmpTerm
+	}
+
+	timer, tmpTerm := prepareElection()
 	c.startElection(tmpTerm)
-
+	
 	for c.getRole() == CANDIDATE {
 		select {
 		case <- timer:
-			c.ElecLogger.Printf("Election timeout ended, checking if election has been decided\n")
-		// TODO: process data
+			c.ElecLogger.Printf("Election timeout ended for term=%d, restarting election\n", tmpTerm)
+			
+			timer, tmpTerm = prepareElection()
+			c.startElection(tmpTerm)
+		// Another CANDIDATE is requesting an election, would be nice if we cared...
 		case <- c.ReqVoteRequestChan:
 			c.ElecLogger.Printf("Bruh i don't give a fuck\n")
+		case <- c.AppendEntryRequestChan:
+			// c.ElecLogger.Printf("Bruh i don't give a fuck\n")
+			// TODO
+		
+		// Respond to election
+		case reply := <- c.ReqVoteResponseChan:
+			c.ElecLogger.Printf("RequestVote RPC response received for term=%d\n", tmpTerm)
+
+			newState := c.getRole()
+			if newState != CANDIDATE {
+				c.ElecLogger.Printf("State %s is no longer CANDIDATE (probably shouldn't happen)\n", newState.String())
+
+				return 
+			}
+
+			// c.Mu.Lock()
+			if reply.NewTerm > tmpTerm {
+				c.ElecLogger.Printf("Received term=%d is greater than current term=%d\n", reply.NewTerm, tmpTerm)
+
+				c.Mu.Lock()
+				c.CurrentTerm = reply.NewTerm
+				c.Mu.Unlock()
+				c.setRole(FOLLOWER)
+			} else if reply.NewTerm == tmpTerm {
+				c.ElecLogger.Printf("Received term=%d is equal to the current term=%d\n", reply.NewTerm, tmpTerm)
+
+				// check if we receive a vote
+				if reply.VoteGranted {
+					c.ElecLogger.Printf("Vote received from client: %s\n", reply.ClientName)
+					c.VotesReceived = append(c.VotesReceived, reply.ClientName)
+					if len(c.VotesReceived) >= MAJORITY {
+						c.ElecLogger.Printf("Majority vote received of %d\n", MAJORITY)
+						c.setRole(LEADER)
+					}
+				} else {
+					c.ElecLogger.Printf("Vote not received from client: %s\n", reply.ClientName)
+				}
+			} else {
+				panic("Reply's new term should never be less than the current term.\n")
+			}
+			// c.Mu.Unlock()
 		}
 	}
 }
 
 func (c *ClientInfo) leader() {
-	
+	c.ElecLogger.Printf("State: LEADER\n")
+
+	c.Mu.Lock()
+	tmpTerm := c.CurrentTerm
+	c.VotesReceived = make([]string, 0)
+	c.VotedFor = ""
+	c.Mu.Unlock()
+
+	// start heartbeat timer to send AppendEntry RPC
+	heartbeat := time.NewTicker(TIMEOUT / 2 * time.Second)
+	defer heartbeat.Stop()
+
+	for c.getRole() == LEADER {
+		select {
+		// send out AppendEntry RPC
+		case <- heartbeat.C:
+			c.sendHeartBeat(tmpTerm)
+		case reply := <- c.AppendEntryResponseChan:
+			c.ElecLogger.Printf("AppendEntry RPC response received for term=%d\n", tmpTerm)
+
+			if reply.NewTerm > tmpTerm {
+				c.ElecLogger.Printf("Received term=%d is higher than our term=%d, stepping down\n", reply.NewTerm, tmpTerm)
+				
+				c.Mu.Lock()
+				c.CurrentTerm = reply.NewTerm
+				c.Mu.Unlock()
+				c.setRole(FOLLOWER)
+			}
+		case <- c.ReqVoteRequestChan:
+		case <- c.AppendEntryRequestChan:
+			// TODO
+		}
+	}
 }
 
 // Start election after becoming a CANDIDATE
@@ -337,7 +530,7 @@ func (c *ClientInfo) startElection(term int) {
 
 		if exists {
 			go func(connection net.Conn, clientName string){
-				c.ElecLogger.Printf("Sending RequestVote RPC to client: %s", clientName)
+				c.ElecLogger.Printf("Sending RequestVote RPC to client: %s\n", clientName)
 
 				c.Mu.Lock()
 				requestData := RequestVoteRequest {
@@ -349,17 +542,65 @@ func (c *ClientInfo) startElection(term int) {
 
 				c.Mu.Unlock()
 
-				message := []byte(string(strconv.Itoa(int(REQUESTVOTE_REQ)) + DELIM))
-				// fmt.Println(string(strconv.Itoa(int(REQUESTVOTE_REQ)) + DELIM)
-				message = append(message, requestData.Marshal()...)
-				message = append(message, byte('@'))
-				c.writeToConnection(c.ClientName, connection, message, fmt.Sprintf("RequestVote RPC with data: %+v", requestData))
+				// message := []byte(string(strconv.Itoa(int(REQUESTVOTE_REQ)) + DELIM))
+				// // fmt.Println(string(strconv.Itoa(int(REQUESTVOTE_REQ)) + DELIM)
+				// message = append(message, requestData.Marshal()...)
+				// message = append(message, byte(MSG_DELIM))
+				// c.writeToConnection(c.ClientName, connection, message, fmt.Sprintf("RequestVote RPC with data: %+v", requestData))
 
+				c.sendRPC(REQUESTVOTE_REQ, &requestData, connection, fmt.Sprintf("RequestVote RPC with data: %+v", requestData))	
 			}(conn, clientName)
 		}
 	}
+}
 
-	// fmt.Println("After checking.")
+func (c *ClientInfo) sendHeartBeat(term int) {
+	for _, clientName := range c.OutboundConns.Keys() {
+		conn, exists := c.OutboundConns.Get(clientName)
+
+		if exists {
+			go func(connection net.Conn, clientName string) {
+				c.ElecLogger.Printf("Sending AppendEntry RPC to client: %s\n", clientName)
+
+				c.Mu.Lock()
+
+				prevLogIndex := c.LastLogIndex - 1
+				var prevLogTerm, commitIndex int
+				if prevLogIndex < 0 {
+					prevLogTerm = 0
+					commitIndex = -1
+				} else {
+					// fetch term from log
+					prevLogTerm = c.ReplicatedLog[prevLogIndex].Term
+					
+					for idx, entry := range c.ReplicatedLog {
+						if entry.Committed {
+							commitIndex = idx
+						} else {
+							break
+						}
+					}
+				}
+
+				requestData := AppendEntryRequest {
+					Term: term, 
+					LeaderName: c.ClientName,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm: prevLogTerm,
+					Entries: nil, // Entries being nil means heartbeat
+					CommitIndex: commitIndex,
+				}
+				c.Mu.Unlock()
+
+				// message := []byte(string(strconv.Itoa(int(APPENDENTRIES_REQ)) + DELIM))
+				// message = append(message, requestData.Marshal()...)
+				// message = append(message, byte(MSG_DELIM))
+
+				// c.writeToConnection(c.ClientName, connection, message, fmt.Sprintf("AppendEntry RPC with data: %+v", requestData))
+				c.sendRPC(APPENDENTRIES_REQ, &requestData, connection, fmt.Sprintf("AppendEntry RPC with data: %+v", requestData))
+			}(conn, clientName)
+		}
+	}
 }
 
 func (c *ClientInfo) getRole() Role {
@@ -386,7 +627,7 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 	reader := bufio.NewReader(connection)
 	for {
 		// TODO: receive incoming messages, identify the message type, demarshal into the appropriate data structure, and pass the struct to the appropriate channel for RAFT to handle
-		bytes, err := reader.ReadBytes('@')
+		bytes, err := reader.ReadBytes(MSG_DELIM)
 		
 		if err != nil {
 			c.ConnLogger.Printf("Inbound connection from client %s has disconnected\n", clientName)
@@ -397,7 +638,7 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 		// parse command identification
 		parse := strings.Split(string(bytes[:len(bytes) - 1]), DELIM)
 		id := parse[0]
-		data := parse[1] // must remove newline later
+		data := parse[1]
 
 		c.ConnLogger.Printf("Received command [%s] from %s with data [%s]\n", strings.ToUpper(id), clientName, data)
 		
@@ -407,36 +648,48 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 }
 
 func (c *ClientInfo) reqChan(id Rpc, b []byte) {
-	fmt.Println("Enter")
 	c.Mu.Lock()
-	fmt.Println("Enter past lock")
 	defer c.Mu.Unlock()
 	switch id {
 	// If CANDIDATE, respond to the RequestVote result. Otherwise, ignore the request
 	case REQUESTVOTE_REPLY:
-		// fmt.Println("Enter past use case")
 		var data RequestVoteResponse
 		if c.CurrentRole == CANDIDATE {
 			data.Demarshal(b)
 			c.ReqVoteResponseChan <- data
 		}
-		// fmt.Println("Enter past demarshal")
 	// All roles must respond to the RequestVote request
 	case REQUESTVOTE_REQ:
-		fmt.Println("Enter past use case")
 		var data RequestVoteRequest
 		data.Demarshal(b)
-		fmt.Println("Enter past demarshal")
 		c.ReqVoteRequestChan <- data
-		fmt.Println("Enter past chan")
+	// Only the LEADER must answer the AppendEntry result
+	case APPENDENTRIES_REPLY:
+		var data AppendEntryResponse
+		if c.CurrentRole == LEADER {
+			data.Demarshal(b)
+			c.AppendEntryResponseChan <- data
+		}
+	// All roles must respond to the AppendEntry request
+	case APPENDENTRIES_REQ:
+		var data AppendEntryRequest
+		data.Demarshal(b)
+		c.AppendEntryRequestChan <- data
 	}
-	fmt.Println("Leave")
 }
 
 // if minTime = 5, election timer lasts between 5 and 10 seconds
 func newElectionTimer(rand *rand.Rand, minTime time.Duration) (<-chan time.Time, time.Duration) {
 	extra := time.Duration(rand.Int63()) % minTime
 	return time.After(minTime + extra), minTime + extra
+}
+
+func (c *ClientInfo) sendRPC(reqId Rpc, data Marshaller, connection net.Conn, errMsg string) {
+	message := []byte(string(strconv.Itoa(int(reqId)) + DELIM))
+	message = append(message, data.Marshal()...)
+	message = append(message, byte(MSG_DELIM))
+
+	c.writeToConnection(c.ClientName, connection, message, errMsg)
 }
 
 // Write a message to the passed connection object
