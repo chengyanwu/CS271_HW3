@@ -30,9 +30,9 @@ const (
 )
 
 const (
-	GET Action = iota
-	PUT
-	DELETE
+	GET Action = iota // get value from dict
+	PUT               // put new value onto dict
+	CREATE            // create new dictionary
 )
 
 const (
@@ -99,18 +99,43 @@ type ClientInfo struct {
 	r             *rand.Rand
 }
 
-type LogEntry struct {
-	Index     int
-	Term      int
-	Committed bool
-	Command   Command
+// PROTOCOL: [identifier:marshalled byte slice]
+type Marshaller interface {
+	Marshal() []byte
+	Demarshal([]byte) 
 }
 
-type Command struct {
-	Key string
-	Value string
-	Action Action
+// Struct representing a single entry on the log, will be written/read to/from the disk in byte format
+type LogEntry struct {
+	Index            int
+	Term             int
+	Committed        bool
+	Action           Action
+	LogGetCommand    LogGetCommand
+	LogPutCommand 	 LogPutCommand
+	LogCreateCommand LogCreateCommand
 }
+
+// === THESE STRUCTS ARE FOR LOG ONLY AND WON'T BE SENT OVER THE NETWORK ===
+type LogGetCommand struct {
+	DictionaryId string
+	ClientId	 string // id of client who issued the command
+	EncryptedKey []byte // encrypted with the dictionary's public key
+}
+
+type LogPutCommand struct {
+	DictionaryId      string
+	ClientId          string // id of client who issued the command
+	EncryptedKeyValue []byte // encrypted with the dictionary's public key
+}
+
+type LogCreateCommand struct {
+	DictionaryId          string
+	MemberClientId        []string // A, B, C, etc.
+	DictionaryPublicKey   []byte   // dictionary's unencrypted public key
+	DictionaryPrivateKeys [][]byte // encrypted dictionary's private keys using MemberClientId's public keys (can only be decrypted using the right private key for each member)
+}
+// ==========================================================================
 
 type ConnectionInfo struct {
 	Connection net.Conn
@@ -125,19 +150,34 @@ type LeaderInfo struct {
 	OutboundConnection net.Conn
 }
 
-// PROTOCOL: [identifier:marshalled byte slice]
-type Marshaller interface {
-	Marshal() []byte
-	Demarshal([]byte) 
-}
-
-// TODO: declare struct types for PROTOCOL information msgs (should implement the Marshaller interface)
+// === THESE STRUCTS ARE FOR SENDING OVER THE NETWORK FOR RAFT ALGORITHM ===
 type RequestVoteRequest struct {
 	CandidateName string
 	CandidateTerm int
 	LastLogIndex  int
 	LastLogTerm   int
 }
+type RequestVoteResponse struct {
+	NewTerm     int
+	VoteGranted bool
+	ClientName  string
+}
+
+type AppendEntryRequest struct {
+	Term         int
+	LeaderName   string
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	CommitIndex  int
+}
+
+type AppendEntryResponse struct {
+	NewTerm int  // term of self, may be higher than the LEADER who sent the AE RPC
+	Success bool // true if previous entries of FOLLOWER were all committed
+}
+
+// ===========================================================================
 
 func (r *RequestVoteRequest) Marshal() []byte {
 	bytes, err := json.Marshal(r)
@@ -153,11 +193,6 @@ func (r *RequestVoteRequest) Demarshal(b []byte) {
 	json.Unmarshal(b, r)
 }
 
-type RequestVoteResponse struct {
-	NewTerm     int
-	VoteGranted bool
-	ClientName  string
-}
 
 func (r *RequestVoteResponse) Marshal() []byte {
 	bytes, err := json.Marshal(r)
@@ -171,15 +206,6 @@ func (r *RequestVoteResponse) Marshal() []byte {
 
 func (r *RequestVoteResponse) Demarshal(b []byte) {
 	json.Unmarshal(b, r)
-}
-
-type AppendEntryRequest struct {
-	Term         int
-	LeaderName   string
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	CommitIndex  int
 }
 
 func (a *AppendEntryRequest) Marshal() []byte {
@@ -196,11 +222,6 @@ func (a *AppendEntryRequest) Demarshal(b []byte) {
 	json.Unmarshal(b, a)
 }
 
-type AppendEntryResponse struct {
-	NewTerm int  // term of self, may be higher than the LEADER who sent the AE RPC
-	Success bool // true of previous entries of FOLLOWER were all committed
-}
-
 func (a *AppendEntryResponse) Marshal() []byte {
 	bytes, err := json.Marshal(a)
 
@@ -213,6 +234,20 @@ func (a *AppendEntryResponse) Marshal() []byte {
 
 func (a *AppendEntryResponse) Demarshal(b []byte) {
 	json.Unmarshal(b, a)
+}
+
+func (l *LogEntry) Marshal() []byte {
+	bytes, err := json.Marshal(l)
+
+	if err != nil {
+		panic(fmt.Sprintf("Failed to marshal LogEntry struct: %v\n", *l))
+	}
+
+	return bytes
+}
+
+func (l *LogEntry) Demarshal(b []byte) {
+	json.Unmarshal(b, l)
 }
 
 // Check if current client is the leader
@@ -402,7 +437,7 @@ func (c *ClientInfo) follower() {
 			// LEADER term matches our term
 			} else if request.Term == currentTerm {
 				// TODO: after we finish leader election
-				c.ElecLogger.Printf("LEADER's term=%d is same as our term, we love our LEADER %s <3\n", request.Term, request.LeaderName)
+				// c.ElecLogger.Printf("LEADER's term=%d is same as our term, we love our LEADER %s <3\n", request.Term, request.LeaderName)
 				responseData.NewTerm = currentTerm
 				responseData.Success = true
 				
