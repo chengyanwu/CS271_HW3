@@ -113,9 +113,11 @@ type LogEntry struct {
 	Index            int
 	Term             int
 	Action           Action
+	// ====== ONLY ONE of these structs should only be filled in based on the action  ======
 	LogGetCommand    LogGetCommand
 	LogPutCommand 	 LogPutCommand
 	LogCreateCommand LogCreateCommand
+	// =====================================================================================
 	CommandId        string
 	CommandOutput    string // If command is committed, the output will be shown here
 }
@@ -183,14 +185,14 @@ type AppendEntryResponse struct {
 
 // Raw commands represent commands sent by the clients over the network, before encryption occurs.
 // Should map 1-1 to user input in the console
-type RawCommand struct {
-	SenderName   string // name of client who sent the command
+type RawCommand struct { // create A B D C
+	SenderName   string   // name of client who sent the command
 	Action       Action
-	ClientIds    []string
-	DictionaryId string
-	Key          string
-	Value        string
-	CommandId    string // ID unique to each command so clients can distinguish if command has already been committed
+	ClientIds    []string // blank for GET and PUT
+	DictionaryId string   // blank for CREATE
+	Key          string   // blank for CREATE
+	Value        string   // blank for CREATE, GET
+	CommandId    string   // ID unique to each command so clients can distinguish if command has already been committed
 }
 
 // Represent responses sent to the requesting client after Command on leader is committed
@@ -959,7 +961,7 @@ func (c *ClientInfo) handleWriteError(err error, errMessage string, connection n
 	}
 }
 
-// Submits the command to the log if client is the leader
+// Submits the command to the log if client is leader
 func (c *ClientInfo) submit(command RawCommand) {
 	c.Mu.Lock()
 	defer c.Mu.Unlock()
