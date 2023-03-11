@@ -12,17 +12,19 @@ type Dictionary struct {
 	Dict      map[string]string
 }
 
-func (d *Dictionary) New(id string, cnt int, clientIDs []string, publicKey string, dict map[string]string) {
-	d.Dict_ID = id + strconv.Itoa(cnt)
-	d.ClientIDs = clientIDs
-	d.PublicKey = publicKey
-	d.Dict = dict
+func (d *Dictionary) NewDict(id string, cnt int, clientIDs []string, publicKey string, dict map[string]string) Dictionary {
+	return Dictionary{
+		Dict_ID:   id + strconv.Itoa(cnt),
+		ClientIDs: clientIDs,
+		PublicKey: publicKey,
+		Dict:      dict,
+	}
 }
 
-func (d *Dictionary) put(key string, value string) {
+func (d *Dictionary) Put(key string, value string) {
 	d.Dict[key] = value
 }
 
-func (d *Dictionary) get(key string) string {
+func (d *Dictionary) Get(key string) string {
 	return d.Dict[key]
 }
