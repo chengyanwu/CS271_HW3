@@ -31,9 +31,9 @@ const (
 )
 
 const (
-	GET Action = iota
-	PUT
-	DELETE
+	GET Action = iota // get value from dict
+	PUT               // put new value onto dict
+	CREATE            // create new dictionary
 )
 
 const (
@@ -41,6 +41,8 @@ const (
 	REQUESTVOTE_REPLY
 	APPENDENTRIES_REQ
 	APPENDENTRIES_REPLY
+	COMMAND             // raw get, put, or create command sent by any client to its current leader
+	COMMAND_REPLY       // response to the get, put, or create command sent by leader after it commits the command
 )
 
 const (
@@ -82,19 +84,21 @@ type ClientInfo struct {
 	LogStore      disk.LogStore // interact to store logs and other info on disk
 
 	// TODO: StateMachine storage.ReplicatedDictOfDicts
-	Faillinks  map[string]net.Conn // Stop sending messages to and ignores messages received from the connections here
-	Keys       crypto.Keys         // public and private keys
-	DiskLogger *log.Logger         // logs information about AppendEntry RPCs and commits to the state machine
-	ElecLogger *log.Logger         // logs information about Election RPCs and leader changes
-	ConnLogger *log.Logger         // logs information about outgoing and ingoing messages on connections, and connection disconnects
+	Faillinks     map[string]net.Conn // Stop sending messages to and ignores messages received from the connections here
+	Keys		  crypto.Keys         // public and private keys
+	DiskLogger	  *log.Logger         // logs information about AppendEntry RPCs and commits to the state machine
+	ElecLogger    *log.Logger		  // logs information about Election RPCs and leader changes
+	ConnLogger    *log.Logger         // logs information about outgoing and ingoing messages on connections, and connection disconnects
+	CommandLogger *log.Logger         // logs information about handling commands from the client
 
-	// LastContact   time.Time           // tracks last contact with the leader
 
 	// Communication channels for RPC
 	ReqVoteRequestChan      chan RequestVoteRequest
 	ReqVoteResponseChan     chan RequestVoteResponse
 	AppendEntryRequestChan  chan AppendEntryRequest
 	AppendEntryResponseChan chan AppendEntryResponse
+
+	CommitChan				chan<- *LogEntry // Channel that contains LogEntry structs to commit
 
 	// Random number generator
 	r *rand.Rand
@@ -104,18 +108,45 @@ type ClientInfo struct {
 	DictList    []dictionary.Dictionary
 }
 
-type LogEntry struct {
-	Index     int
-	Term      int
-	Committed bool
-	Command   Command
+// PROTOCOL: [identifier:marshalled byte slice]
+type Marshaller interface {
+	Marshal() []byte
+	Demarshal([]byte) 
 }
 
-type Command struct {
-	Key    string
-	Value  string
-	Action Action
+// Struct representing a single entry on the log, will be written/read to/from the disk in byte format
+type LogEntry struct {
+	Index            int
+	Term             int
+	Action           Action
+	LogGetCommand    LogGetCommand
+	LogPutCommand 	 LogPutCommand
+	LogCreateCommand LogCreateCommand
+	CommandId        string
+	CommandOutput    string // If command is committed, the output will be shown here
 }
+
+// === THESE STRUCTS ARE FOR LOG ONLY AND WON'T BE SENT OVER THE NETWORK ===
+type LogGetCommand struct {
+	DictionaryId string
+	ClientId	 string // id of client who issued the command
+	EncryptedKey []byte // encrypted with the dictionary's public key
+}
+
+type LogPutCommand struct {
+	DictionaryId      string
+	ClientId          string // id of client who issued the command
+	EncryptedKeyValue []byte // encrypted with the dictionary's public key
+
+}
+
+type LogCreateCommand struct {
+	DictionaryId          string
+	MemberClientId        []string // A, B, C, etc.
+	DictionaryPublicKey   []byte   // dictionary's unencrypted public key
+	DictionaryPrivateKeys [][]byte // encrypted dictionary's private keys using MemberClientId's public keys (can only be decrypted using the right private key for each member)
+}
+// ==========================================================================
 
 type ConnectionInfo struct {
 	Connection net.Conn
@@ -130,52 +161,17 @@ type LeaderInfo struct {
 	OutboundConnection net.Conn
 }
 
-// PROTOCOL: [identifier:marshalled byte slice]
-type Marshaller interface {
-	Marshal() []byte
-	Demarshal([]byte)
-}
-
-// TODO: declare struct types for PROTOCOL information msgs (should implement the Marshaller interface)
+// === THESE STRUCTS ARE FOR SENDING OVER THE NETWORK FOR RAFT ALGORITHM ===
 type RequestVoteRequest struct {
 	CandidateName string
 	CandidateTerm int
 	LastLogIndex  int
 	LastLogTerm   int
 }
-
-func (r *RequestVoteRequest) Marshal() []byte {
-	bytes, err := json.Marshal(r)
-
-	if err != nil {
-		panic(fmt.Sprintf("Failed to marshal RequestVoteRequest struct: %v\n", *r))
-	}
-
-	return bytes
-}
-
-func (r *RequestVoteRequest) Demarshal(b []byte) {
-	json.Unmarshal(b, r)
-}
-
 type RequestVoteResponse struct {
 	NewTerm     int
 	VoteGranted bool
 	ClientName  string
-}
-
-func (r *RequestVoteResponse) Marshal() []byte {
-	bytes, err := json.Marshal(r)
-
-	if err != nil {
-		panic(fmt.Sprintf("Failed to marshal RequestVoteResponse struct: %v\n", *r))
-	}
-
-	return bytes
-}
-
-func (r *RequestVoteResponse) Demarshal(b []byte) {
-	json.Unmarshal(b, r)
 }
 
 type AppendEntryRequest struct {
@@ -185,6 +181,59 @@ type AppendEntryRequest struct {
 	PrevLogTerm  int
 	Entries      []LogEntry
 	CommitIndex  int
+}
+
+type AppendEntryResponse struct {
+	NewTerm int  // term of self, may be higher than the LEADER who sent the AE RPC
+	Success bool // true if previous entries of FOLLOWER were all committed
+}
+
+// Raw commands represent commands sent by the clients over the network, before encryption occurs.
+// Should map 1-1 to user input in the console
+type RawCommand struct {
+	SenderName   string // name of client who sent the command
+	Action       Action
+	ClientIds    []string
+	DictionaryId string
+	Key          string
+	Value        string
+	CommandId    string // ID unique to each command so clients can distinguish if command has already been committed
+}
+
+// Represent responses sent to the requesting client after Command on leader is committed
+type CommandResponse struct {
+	Message string // will be printed on the console
+}
+
+// ===========================================================================
+
+func (r *RequestVoteRequest) Marshal() []byte {
+	bytes, err := json.Marshal(r)
+
+	if err != nil {
+		panic(fmt.Sprintf("Failed to marshal RequestVoteRequest struct: %+v\n", *r))
+	}
+
+	return bytes
+}
+
+func (r *RequestVoteRequest) Demarshal(b []byte) {
+	json.Unmarshal(b, r)
+}
+
+
+func (r *RequestVoteResponse) Marshal() []byte {
+	bytes, err := json.Marshal(r)
+
+	if err != nil {
+		panic(fmt.Sprintf("Failed to marshal RequestVoteResponse struct: %+v\n", *r))
+	}
+
+	return bytes
+}
+
+func (r *RequestVoteResponse) Demarshal(b []byte) {
+	json.Unmarshal(b, r)
 }
 
 func (a *AppendEntryRequest) Marshal() []byte {
@@ -201,16 +250,11 @@ func (a *AppendEntryRequest) Demarshal(b []byte) {
 	json.Unmarshal(b, a)
 }
 
-type AppendEntryResponse struct {
-	NewTerm int  // term of self, may be higher than the LEADER who sent the AE RPC
-	Success bool // true of previous entries of FOLLOWER were all committed
-}
-
 func (a *AppendEntryResponse) Marshal() []byte {
 	bytes, err := json.Marshal(a)
 
 	if err != nil {
-		panic(fmt.Sprintf("Failed to marshal AppendEntryResponse struct: %v\n", *a))
+		panic(fmt.Sprintf("Failed to marshal AppendEntryResponse struct: %+v\n", *a))
 	}
 
 	return bytes
@@ -218,6 +262,48 @@ func (a *AppendEntryResponse) Marshal() []byte {
 
 func (a *AppendEntryResponse) Demarshal(b []byte) {
 	json.Unmarshal(b, a)
+}
+
+func (l *LogEntry) Marshal() []byte {
+	bytes, err := json.Marshal(l)
+
+	if err != nil {
+		panic(fmt.Sprintf("Failed to marshal LogEntry struct: %+v\n", *l))
+	}
+
+	return bytes
+}
+
+func (l *LogEntry) Demarshal(b []byte) {
+	json.Unmarshal(b, l)
+}
+
+func (c *RawCommand) Marshal() []byte {
+	bytes, err := json.Marshal(c)
+
+	if err != nil {
+		panic(fmt.Sprintf("Failed to marshal Command struct: %+v\n", *c))
+	}
+
+	return bytes
+}
+
+func (c *RawCommand) Demarshal(b []byte) {
+	json.Unmarshal(b, c)
+}
+
+func (r *CommandResponse) Marshal() []byte {
+	bytes, err := json.Marshal(r)
+
+	if err != nil {
+		panic(fmt.Sprintf("Failed to marshal Command response struct: %+v\n", *r))
+	}
+
+	return bytes
+}
+
+func (r *CommandResponse) Demarshal(b []byte) {
+	json.Unmarshal(b, r)
 }
 
 // Check if current client is the leader
@@ -278,7 +364,7 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.DiskLogger = log.New(os.Stdout, "[FSM]", log.LstdFlags)
 	c.ElecLogger = log.New(os.Stdout, "[ELEC/AE]", log.LstdFlags)
 	c.ConnLogger = log.New(os.Stdout, "[CONN]", log.LstdFlags)
-	// c.LastContact = time.Now()
+	c.CommandLogger = log.New(os.Stdout, "[NEW COMMAND]", log.LstdFlags)
 	c.Keys.New()
 
 	c.ReqVoteRequestChan = make(chan RequestVoteRequest)
@@ -312,7 +398,6 @@ func (c *ClientInfo) RAFT() {
 	c.ElecLogger.Println("RAFT starting, waiting for elections")
 	c.init()
 	for {
-		// TODO: main RAFT loop
 		// switch statement for leader, candidiate, and follower
 		switch c.getRole() {
 		case FOLLOWER:
@@ -339,8 +424,8 @@ func (c *ClientInfo) setupFollower() int {
 func (c *ClientInfo) follower() {
 	c.ElecLogger.Printf("State: FOLLOWER\n")
 	// start election timer, reset election timeout
-	timer, duration := newElectionTimer(c.r, TIMEOUT*time.Second)
-	// c.LastContact = time.Now()
+	timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
+
 
 	currentTerm := c.setupFollower()
 
@@ -348,19 +433,10 @@ func (c *ClientInfo) follower() {
 
 	for c.getRole() == FOLLOWER {
 		select {
-		case <-timer:
-			// c.ElecLogger.Printf("Election timeout ended, checking if heartbeat received from leader\n")
-
-			// // check for timeout, if timeout was received, we start
-			// if time.Since(c.LastContact) < duration {
-			// 	timer, duration = newElectionTimer(c.r, TIMEOUT * time.Second)
-			// 	c.ElecLogger.Printf("Heartbeat received, new election timer started with duration %v, term=%d\n", duration, currentTerm)
-			// 	continue
-			// } else {
+		case <- timer:
 			c.ElecLogger.Printf("AppendEntry heartbeat wasn't received before timeout on term=%d, promoting self to CANDIDATE\n", currentTerm)
 			c.setRole(CANDIDATE)
-			// c.Mu.Unlock()
-			// }
+
 		// Resets timer only if vote is successfully granted to CANDIDATE
 		case request := <-c.ReqVoteRequestChan:
 			c.ElecLogger.Printf("RequestVote request received from CANDIDIATE %s for term=%d, our term=%d\n", request.CandidateName, request.CandidateTerm, currentTerm)
@@ -452,8 +528,8 @@ func (c *ClientInfo) candidate() {
 		c.ElecLogger.Printf("Beginning new election with term %d\n", c.CurrentTerm)
 		c.Mu.Unlock()
 
-		timer, duration := newElectionTimer(c.r, TIMEOUT*time.Second)
-		// c.LastContact = time.Now()
+		timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
+
 		c.ElecLogger.Printf("Election timeout started with duration %v, term=%d\n", duration, tmpTerm)
 
 		return timer, tmpTerm
@@ -505,7 +581,6 @@ func (c *ClientInfo) candidate() {
 			} else {
 				panic("Connection is broken for RequestVote RPC response")
 			}
-			// fmt.Println("Done sending RPC!")
 		// Receive RPC requests, LEADER revived or someone else already won the election
 		case request := <-c.AppendEntryRequestChan:
 			c.ElecLogger.Printf("AppendEntry request received on term=%d\n", tmpTerm)
@@ -557,7 +632,6 @@ func (c *ClientInfo) candidate() {
 				return
 			}
 
-			// c.Mu.Lock()
 			if reply.NewTerm > tmpTerm {
 				c.ElecLogger.Printf("Received term=%d is greater than current term=%d\n", reply.NewTerm, tmpTerm)
 
@@ -582,7 +656,6 @@ func (c *ClientInfo) candidate() {
 			} else {
 				c.ElecLogger.Printf("Reply's term=%d is less than current term=%d, do nothing.\n", reply.NewTerm, tmpTerm)
 			}
-			// c.Mu.Unlock()
 		}
 	}
 }
@@ -756,7 +829,8 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 					prevLogTerm = c.ReplicatedLog[prevLogIndex].Term
 
 					for idx, entry := range c.ReplicatedLog {
-						if entry.Committed {
+						// entry was committed
+						if entry.CommandOutput != "" {
 							commitIndex = idx
 						} else {
 							break
@@ -830,10 +904,6 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 }
 
 func (c *ClientInfo) reqChan(id Rpc, b []byte) {
-	// fmt.Println("Enter")
-	// c.Mu.Lock()
-	// fmt.Println("Enter lock")
-	// defer c.Mu.Unlock()
 	switch id {
 	// If CANDIDATE, respond to the RequestVote result. Otherwise, ignore the request
 	case REQUESTVOTE_REPLY:
@@ -859,8 +929,17 @@ func (c *ClientInfo) reqChan(id Rpc, b []byte) {
 		var data AppendEntryRequest
 		data.Demarshal(b)
 		c.AppendEntryRequestChan <- data
+	// Only the LEADER processes the command and adds it to its log, if valid
+	case COMMAND:
+		var data RawCommand
+		
+		if c.getRole() == LEADER {
+			data.Demarshal(b)
+			c.submit(data)
+		} else {
+			c.CommandLogger.Printf("Client isn't leader, command [%+v] ignored\n", data)
+		}
 	}
-	// fmt.Println("Exit")
 }
 
 // if minTime = 5, election timer lasts between 5 and 10 seconds
@@ -893,4 +972,45 @@ func (c *ClientInfo) handleWriteError(err error, errMessage string, connection n
 
 		c.OutboundConns.Set(clientName, nil)
 	}
+}
+
+// Submits the command to the log if client is the leader
+func (c *ClientInfo) submit(command RawCommand) {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+
+	if c.CurrentRole == LEADER {
+		logEntry := c.handleRawCommand(command)
+		
+		// Check if command has already been submitted to the log (server crashed before response was sent to client)
+		present, output := false, ""
+		for _, entry := range c.ReplicatedLog {
+			if command.CommandId == entry.CommandId {
+				present = true
+				if entry.CommandOutput != "" {
+					output = entry.CommandOutput
+				}
+
+				break
+			}
+		}
+
+		if present && output != "" {
+			// TODO: send message back to client with contents and ignore the command
+			c.CommandLogger.Printf("TODO: send message back to client with contents and ignore the command\n")
+		} else if present {
+			c.CommandLogger.Printf("Command has already been added to the log but has not yet been committed, ignore command\n")
+		} else {
+			c.ReplicatedLog = append(c.ReplicatedLog, logEntry)
+			c.ElecLogger.Printf("LogEntry [%+v] saved locally with term=%d and previous index=%d\n", logEntry, c.CurrentTerm, c.LastLogIndex)
+		}
+
+		// TODO: persist log on disk
+	}
+}
+
+// This function processes the command and generates the log entry. ASSUMPTION: happens under a mutex lock
+func (c *ClientInfo) handleRawCommand(command RawCommand) LogEntry {
+	// TODO: IAN - handle command, create a LogEntry struct and return it
+	return LogEntry{}
 }
