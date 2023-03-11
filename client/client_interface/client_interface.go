@@ -40,7 +40,8 @@ const (
 	REQUESTVOTE_REPLY
 	APPENDENTRIES_REQ
 	APPENDENTRIES_REPLY
-	COMMAND
+	COMMAND             // raw get, put, or create command sent by any client to its current leader
+	COMMAND_REPLY       // response to the get, put, or create command sent by leader after it commits the command
 )
 
 const (
@@ -87,6 +88,7 @@ type ClientInfo struct {
 	DiskLogger	  *log.Logger         // logs information about AppendEntry RPCs and commits to the state machine
 	ElecLogger    *log.Logger		  // logs information about Election RPCs and leader changes
 	ConnLogger    *log.Logger         // logs information about outgoing and ingoing messages on connections, and connection disconnects
+	CommandLogger *log.Logger         // logs information about handling commands from the client
 
 	// Communication channels for RPC
 	ReqVoteRequestChan      chan RequestVoteRequest
@@ -94,7 +96,7 @@ type ClientInfo struct {
 	AppendEntryRequestChan  chan AppendEntryRequest
 	AppendEntryResponseChan chan AppendEntryResponse
 
-	CommitChan				chan<- LogEntry // Channel that contains LogEntry structs to commit
+	CommitChan				chan<- *LogEntry // Channel that contains LogEntry structs to commit
 
 	// Random number generator
 	r             *rand.Rand
@@ -110,12 +112,12 @@ type Marshaller interface {
 type LogEntry struct {
 	Index            int
 	Term             int
-	Committed        bool
 	Action           Action
 	LogGetCommand    LogGetCommand
 	LogPutCommand 	 LogPutCommand
 	LogCreateCommand LogCreateCommand
 	CommandId        string
+	CommandOutput    string // If command is committed, the output will be shown here
 }
 
 // === THESE STRUCTS ARE FOR LOG ONLY AND WON'T BE SENT OVER THE NETWORK ===
@@ -182,6 +184,7 @@ type AppendEntryResponse struct {
 // Raw commands represent commands sent by the clients over the network, before encryption occurs.
 // Should map 1-1 to user input in the console
 type RawCommand struct {
+	SenderName   string // name of client who sent the command
 	Action       Action
 	ClientIds    []string
 	DictionaryId string
@@ -354,6 +357,7 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.DiskLogger = log.New(os.Stdout, "[FSM]", log.LstdFlags)
 	c.ElecLogger = log.New(os.Stdout, "[ELEC/AE]", log.LstdFlags)
 	c.ConnLogger = log.New(os.Stdout, "[CONN]", log.LstdFlags)
+	c.CommandLogger = log.New(os.Stdout, "[NEW COMMAND]", log.LstdFlags)
 	c.Keys.New()
 
 	c.ReqVoteRequestChan = make(chan RequestVoteRequest)
@@ -382,7 +386,6 @@ func (c *ClientInfo) RAFT() {
 	c.ElecLogger.Println("RAFT starting, waiting for elections")
 	c.init()
 	for {
-		// TODO: main RAFT loop
 		// switch statement for leader, candidiate, and follower
 		switch c.getRole() {
 		case FOLLOWER:
@@ -563,7 +566,6 @@ func (c *ClientInfo) candidate() {
 			} else {
 				panic("Connection is broken for RequestVote RPC response")
 			}
-			// fmt.Println("Done sending RPC!")
 		// Receive RPC requests, LEADER revived or someone else already won the election
 		case request := <- c.AppendEntryRequestChan:
 			c.ElecLogger.Printf("AppendEntry request received on term=%d\n", tmpTerm)
@@ -812,7 +814,8 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 					prevLogTerm = c.ReplicatedLog[prevLogIndex].Term
 					
 					for idx, entry := range c.ReplicatedLog {
-						if entry.Committed {
+						// entry was committed
+						if entry.CommandOutput != "" {
 							commitIndex = idx
 						} else {
 							break
@@ -919,7 +922,7 @@ func (c *ClientInfo) reqChan(id Rpc, b []byte) {
 			data.Demarshal(b)
 			c.submit(data)
 		} else {
-			c.ElecLogger.Printf("Client isn't leader, command ignored\n")
+			c.CommandLogger.Printf("Client isn't leader, command [%+v] ignored\n", data)
 		}
 	}
 }
@@ -963,14 +966,32 @@ func (c *ClientInfo) submit(command RawCommand) {
 
 	if c.CurrentRole == LEADER {
 		logEntry := c.handleRawCommand(command)
+		
+		// Check if command has already been submitted to the log (server crashed before response was sent to client)
+		present, output := false, ""
+		for _, entry := range c.ReplicatedLog {
+			if command.CommandId == entry.CommandId {
+				present = true
+				if entry.CommandOutput != "" {
+					output = entry.CommandOutput
+				}
 
-		c.ReplicatedLog = append(c.ReplicatedLog, logEntry)
-		c.ElecLogger.Printf("LogEntry %+v saved locally with term=%d and previous index=%d\n", c.CurrentTerm, c.LastLogIndex)
+				break
+			}
+		}
+
+		if present && output != "" {
+			// TODO: send message back to client with contents and ignore the command
+			c.CommandLogger.Printf("TODO: send message back to client with contents and ignore the command\n")
+		} else if present {
+			c.CommandLogger.Printf("Command has already been added to the log but has not yet been committed, ignore command\n")
+		} else {
+			c.ReplicatedLog = append(c.ReplicatedLog, logEntry)
+			c.ElecLogger.Printf("LogEntry [%+v] saved locally with term=%d and previous index=%d\n", logEntry, c.CurrentTerm, c.LastLogIndex)
+		}
 
 		// TODO: persist log on disk
 	}
-
-	return
 }
 
 // This function processes the command and generates the log entry. ASSUMPTION: happens under a mutex lock
