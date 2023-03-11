@@ -158,7 +158,7 @@ func setupInboundChannel(connection net.Conn, clientName string, clientPort stri
 	}
 }
 
-// Establish outbound connection to the specific port
+// Establish outbound connection to the specific port, return nil if connection doesn't exist
 func establishConnection(clientPort string) net.Conn {
 	connection, err := net.Dial(SERVER_TYPE, SERVER_HOST+":"+clientPort)
 
@@ -179,7 +179,7 @@ func establishConnection(clientPort string) net.Conn {
 
 func takeUserInput() {
 	var action string
-
+	commandIndex := 0
 	fmt.Println("===== Actions =====\np - print client info\n===================")
 	for {
 		_, err := fmt.Scanln(&action)
@@ -188,8 +188,31 @@ func takeUserInput() {
 			fmt.Println("Error occurred when scanning input")
 		} else if action == "p" {
 			fmt.Println(&myInfo)
-		} else if action == "s" {
-			// TODO: Ian
+		// for now, use placeholder command
+		} else if action == "create" {
+			command := client.RawCommand{
+				Action: client.CREATE,
+				SenderName: myInfo.ClientName,
+				CommandId: fmt.Sprintf("%s:%d", myInfo.ClientName, commandIndex),
+			}
+			if myInfo.CheckSelf() {
+				// We are LEADER, just submit to our log
+				go myInfo.Submit(command)
+			} else {
+				// Send RPC to LEADER, keep sending if response not received within 20 seconds
+				myInfo.CurrentLeader.Mu.Lock()
+				conn := myInfo.CurrentLeader.OutboundConnection
+				name := myInfo.CurrentLeader.ClientName
+				myInfo.CurrentLeader.Mu.Unlock()
+
+				if conn != nil {
+					go myInfo.SendRPC(client.COMMAND, &command, conn, "Command send failed, no LEADER yet or LEADER has crashed, will retry\n", name)
+				} else {
+					fmt.Println("Leader not established. TODO: retry")
+				}
+			}
+
+			commandIndex++
 		} else {
 			fmt.Println("Invalid action:", action)
 		}
