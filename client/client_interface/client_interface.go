@@ -31,9 +31,9 @@ const (
 )
 
 const (
-	GET Action = iota // get value from dict
-	PUT               // put new value onto dict
-	CREATE            // create new dictionary
+	GET    Action = iota // get value from dict
+	PUT                  // put new value onto dict
+	CREATE               // create new dictionary
 )
 
 const (
@@ -41,8 +41,8 @@ const (
 	REQUESTVOTE_REPLY
 	APPENDENTRIES_REQ
 	APPENDENTRIES_REPLY
-	COMMAND             // raw get, put, or create command sent by any client to its current leader
-	COMMAND_REPLY       // response to the get, put, or create command sent by leader after it commits the command
+	COMMAND       // raw get, put, or create command sent by any client to its current leader
+	COMMAND_REPLY // response to the get, put, or create command sent by leader after it commits the command
 )
 
 const (
@@ -85,12 +85,11 @@ type ClientInfo struct {
 
 	// TODO: StateMachine storage.ReplicatedDictOfDicts
 	Faillinks     map[string]net.Conn // Stop sending messages to and ignores messages received from the connections here
-	Keys		  crypto.Keys         // public and private keys
-	DiskLogger	  *log.Logger         // logs information about AppendEntry RPCs and commits to the state machine
-	ElecLogger    *log.Logger		  // logs information about Election RPCs and leader changes
+	Keys          crypto.Keys         // public and private keys
+	DiskLogger    *log.Logger         // logs information about AppendEntry RPCs and commits to the state machine
+	ElecLogger    *log.Logger         // logs information about Election RPCs and leader changes
 	ConnLogger    *log.Logger         // logs information about outgoing and ingoing messages on connections, and connection disconnects
 	CommandLogger *log.Logger         // logs information about handling commands from the client
-
 
 	// Communication channels for RPC
 	ReqVoteRequestChan      chan RequestVoteRequest
@@ -98,7 +97,7 @@ type ClientInfo struct {
 	AppendEntryRequestChan  chan AppendEntryRequest
 	AppendEntryResponseChan chan AppendEntryResponse
 
-	CommitChan				chan<- *LogEntry // Channel that contains LogEntry structs to commit
+	CommitChan chan<- *LogEntry // Channel that contains LogEntry structs to commit
 
 	// Random number generator
 	r *rand.Rand
@@ -111,7 +110,7 @@ type ClientInfo struct {
 // PROTOCOL: [identifier:marshalled byte slice]
 type Marshaller interface {
 	Marshal() []byte
-	Demarshal([]byte) 
+	Demarshal([]byte)
 }
 
 // Struct representing a single entry on the log, will be written/read to/from the disk in byte format
@@ -120,7 +119,7 @@ type LogEntry struct {
 	Term             int
 	Action           Action
 	LogGetCommand    LogGetCommand
-	LogPutCommand 	 LogPutCommand
+	LogPutCommand    LogPutCommand
 	LogCreateCommand LogCreateCommand
 	CommandId        string
 	CommandOutput    string // If command is committed, the output will be shown here
@@ -129,7 +128,7 @@ type LogEntry struct {
 // === THESE STRUCTS ARE FOR LOG ONLY AND WON'T BE SENT OVER THE NETWORK ===
 type LogGetCommand struct {
 	DictionaryId string
-	ClientId	 string // id of client who issued the command
+	ClientId     string // id of client who issued the command
 	EncryptedKey []byte // encrypted with the dictionary's public key
 }
 
@@ -146,6 +145,7 @@ type LogCreateCommand struct {
 	DictionaryPublicKey   []byte   // dictionary's unencrypted public key
 	DictionaryPrivateKeys [][]byte // encrypted dictionary's private keys using MemberClientId's public keys (can only be decrypted using the right private key for each member)
 }
+
 // ==========================================================================
 
 type ConnectionInfo struct {
@@ -220,7 +220,6 @@ func (r *RequestVoteRequest) Marshal() []byte {
 func (r *RequestVoteRequest) Demarshal(b []byte) {
 	json.Unmarshal(b, r)
 }
-
 
 func (r *RequestVoteResponse) Marshal() []byte {
 	bytes, err := json.Marshal(r)
@@ -365,7 +364,6 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.ElecLogger = log.New(os.Stdout, "[ELEC/AE]", log.LstdFlags)
 	c.ConnLogger = log.New(os.Stdout, "[CONN]", log.LstdFlags)
 	c.CommandLogger = log.New(os.Stdout, "[NEW COMMAND]", log.LstdFlags)
-	c.Keys.New()
 
 	c.ReqVoteRequestChan = make(chan RequestVoteRequest)
 	c.ReqVoteResponseChan = make(chan RequestVoteResponse)
@@ -375,6 +373,10 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	// set up RNG
 	generator := rand.NewSource(processID)
 	c.r = rand.New(generator)
+
+	// set up public and private key
+	c.Keys = crypto.NewKeys()
+	c.Keys.Print()
 
 	// set up dictionary list
 	c.DictCounter = 0
@@ -424,8 +426,7 @@ func (c *ClientInfo) setupFollower() int {
 func (c *ClientInfo) follower() {
 	c.ElecLogger.Printf("State: FOLLOWER\n")
 	// start election timer, reset election timeout
-	timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
-
+	timer, duration := newElectionTimer(c.r, TIMEOUT*time.Second)
 
 	currentTerm := c.setupFollower()
 
@@ -433,7 +434,7 @@ func (c *ClientInfo) follower() {
 
 	for c.getRole() == FOLLOWER {
 		select {
-		case <- timer:
+		case <-timer:
 			c.ElecLogger.Printf("AppendEntry heartbeat wasn't received before timeout on term=%d, promoting self to CANDIDATE\n", currentTerm)
 			c.setRole(CANDIDATE)
 
@@ -528,7 +529,7 @@ func (c *ClientInfo) candidate() {
 		c.ElecLogger.Printf("Beginning new election with term %d\n", c.CurrentTerm)
 		c.Mu.Unlock()
 
-		timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
+		timer, duration := newElectionTimer(c.r, TIMEOUT*time.Second)
 
 		c.ElecLogger.Printf("Election timeout started with duration %v, term=%d\n", duration, tmpTerm)
 
@@ -932,7 +933,7 @@ func (c *ClientInfo) reqChan(id Rpc, b []byte) {
 	// Only the LEADER processes the command and adds it to its log, if valid
 	case COMMAND:
 		var data RawCommand
-		
+
 		if c.getRole() == LEADER {
 			data.Demarshal(b)
 			c.submit(data)
@@ -981,7 +982,7 @@ func (c *ClientInfo) submit(command RawCommand) {
 
 	if c.CurrentRole == LEADER {
 		logEntry := c.handleRawCommand(command)
-		
+
 		// Check if command has already been submitted to the log (server crashed before response was sent to client)
 		present, output := false, ""
 		for _, entry := range c.ReplicatedLog {
