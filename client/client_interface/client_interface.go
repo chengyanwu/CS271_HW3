@@ -42,7 +42,6 @@ const (
 	APPENDENTRIES_REQ
 	APPENDENTRIES_REPLY
 	COMMAND             // raw get, put, or create command sent by any client to its current leader
-	COMMAND_REPLY       // response to the get, put, or create command sent by leader after it commits the command
 )
 
 const (
@@ -66,6 +65,23 @@ func (r Role) String() string {
 	}
 }
 
+func (r Rpc) String() string {
+	switch r {
+	case REQUESTVOTE_REQ:
+		return "RequestVote request"
+	case REQUESTVOTE_REPLY:
+		return "RequestVote reply"
+	case APPENDENTRIES_REQ:
+		return "AppendEntry request"
+	case APPENDENTRIES_REPLY:
+		return "AppendEntry reply"
+	case COMMAND:
+		return "Client command"
+	default:
+		return "Unknown"
+	}
+}
+
 // Configuration for a client that implements the RAFT consensus algorithm
 type ClientInfo struct {
 	ProcessId     int64               // process ID identifier, for encryption purposes
@@ -75,6 +91,10 @@ type ClientInfo struct {
 	CurrentTerm   int                 // current leader term
 	LastLogIndex  int                 // index of latest entry in the log
 	LastLogTerm   int                 // term of the latest entry in the log
+
+	CommitIndex   int                 // Furthest known applied commit index across the system
+	LastApplied   int                 // Index of the last applied commit on the current server, used when the server recovers
+
 	ReplicatedLog []LogEntry          // log entries, read from the disk
 	VotedFor      string              // name of client voted for leader
 	CurrentRole   Role                // 1: follower / 2: leader / 3: candidate
@@ -98,7 +118,7 @@ type ClientInfo struct {
 	AppendEntryRequestChan  chan AppendEntryRequest
 	AppendEntryResponseChan chan AppendEntryResponse
 
-	CommitChan				chan<- *LogEntry // Channel that contains LogEntry structs to commit
+	CommitChan				chan<- LogEntry // Channel that contains LogEntry structs to commit
 
 	// Random number generator
 	r *rand.Rand
@@ -116,7 +136,7 @@ type Marshaller interface {
 
 // Struct representing a single entry on the log, will be written/read to/from the disk in byte format
 type LogEntry struct {
-	Index            int
+	// Index            int
 	Term             int
 	Action           Action
 	// ====== ONLY ONE of these structs should only be filled in based on the action  ======
@@ -125,7 +145,6 @@ type LogEntry struct {
 	LogCreateCommand LogCreateCommand
 	// =====================================================================================
 	CommandId        string
-	CommandOutput    string // If command is committed, the output will be shown here
 }
 
 // === THESE STRUCTS ARE FOR LOG ONLY AND WON'T BE SENT OVER THE NETWORK ===
@@ -203,9 +222,9 @@ type RawCommand struct { // create A B D C
 }
 
 // Represent responses sent to the requesting client after Command on leader is committed
-type CommandResponse struct {
-	Message string // will be printed on the console
-}
+// type CommandResponse struct {
+// 	Message string // will be printed on the console
+// }
 
 // ===========================================================================
 
@@ -294,23 +313,25 @@ func (c *RawCommand) Demarshal(b []byte) {
 	json.Unmarshal(b, c)
 }
 
-func (r *CommandResponse) Marshal() []byte {
-	bytes, err := json.Marshal(r)
+// func (r *CommandResponse) Marshal() []byte {
+// 	bytes, err := json.Marshal(r)
 
-	if err != nil {
-		panic(fmt.Sprintf("Failed to marshal Command response struct: %+v\n", *r))
-	}
+// 	if err != nil {
+// 		panic(fmt.Sprintf("Failed to marshal Command response struct: %+v\n", *r))
+// 	}
 
-	return bytes
-}
+// 	return bytes
+// }
 
-func (r *CommandResponse) Demarshal(b []byte) {
-	json.Unmarshal(b, r)
-}
+// func (r *CommandResponse) Demarshal(b []byte) {
+// 	json.Unmarshal(b, r)
+// }
 
 // Check if current client is the leader
 func (c *ClientInfo) CheckSelf() bool {
-	return c.CurrentLeader.ClientName == c.ClientName
+	c.CurrentLeader.Mu.Lock()
+	defer c.CurrentLeader.Mu.Unlock()
+	return !c.CurrentLeader.NoLeader && c.CurrentLeader.ClientName == c.ClientName
 }
 
 func (l *LeaderInfo) clearLeader() {
@@ -355,6 +376,10 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.CurrentTerm = 0
 	c.LastLogIndex = -1
 	c.LastLogTerm = 0
+
+	c.LastApplied = -1
+	c.CommitIndex = -1
+
 	c.ReplicatedLog = make([]LogEntry, 0)
 	c.VotedFor = ""
 	c.CurrentRole = FOLLOWER
@@ -470,7 +495,7 @@ func (c *ClientInfo) follower() {
 			responseData.ClientName = c.ClientName
 
 			if conn != nil {
-				c.sendRPC(REQUESTVOTE_REPLY, &responseData, conn, fmt.Sprintf("RequestVote RPC response with data: %+v", responseData), request.CandidateName)
+				c.SendRPC(REQUESTVOTE_REPLY, &responseData, conn, fmt.Sprintf("RequestVote RPC response with data: %+v", responseData), request.CandidateName)
 			} else {
 				panic("Connection is broken for RequestVote RPC response")
 			}
@@ -509,7 +534,7 @@ func (c *ClientInfo) follower() {
 			}
 
 			if conn != nil {
-				c.sendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
+				c.SendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
 			} else {
 				// If failed, we don't have to send it over
 				panic("Connection is broken for AppendEntry RPC response")
@@ -526,6 +551,7 @@ func (c *ClientInfo) candidate() {
 		c.Mu.Lock()
 		c.CurrentTerm += 1
 		tmpTerm := c.CurrentTerm
+		c.VotesReceived = make([]string, 0)
 
 		c.ElecLogger.Printf("Beginning new election with term %d\n", c.CurrentTerm)
 		c.Mu.Unlock()
@@ -579,7 +605,7 @@ func (c *ClientInfo) candidate() {
 			responseData.ClientName = c.ClientName
 
 			if conn != nil {
-				c.sendRPC(REQUESTVOTE_REPLY, &responseData, conn, fmt.Sprintf("RequestVote RPC response with data: %+v", responseData), request.CandidateName)
+				c.SendRPC(REQUESTVOTE_REPLY, &responseData, conn, fmt.Sprintf("RequestVote RPC response with data: %+v", responseData), request.CandidateName)
 			} else {
 				panic("Connection is broken for RequestVote RPC response")
 			}
@@ -618,7 +644,7 @@ func (c *ClientInfo) candidate() {
 			}
 
 			if conn != nil {
-				c.sendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
+				c.SendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
 			} else {
 				// If failed, we don't have to send it over
 				panic("Connection is broken for AppendEntry RPC response")
@@ -725,7 +751,7 @@ func (c *ClientInfo) leader() {
 			responseData.ClientName = c.ClientName
 
 			if conn != nil {
-				c.sendRPC(REQUESTVOTE_REPLY, &responseData, conn, fmt.Sprintf("RequestVote RPC response with data: %+v", responseData), request.CandidateName)
+				c.SendRPC(REQUESTVOTE_REPLY, &responseData, conn, fmt.Sprintf("RequestVote RPC response with data: %+v", responseData), request.CandidateName)
 			} else {
 				panic("Connection is broken for RequestVote RPC response")
 			}
@@ -763,7 +789,7 @@ func (c *ClientInfo) leader() {
 			}
 
 			if conn != nil {
-				c.sendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
+				c.SendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
 			} else {
 				// If failed, we don't have to send it over
 				panic("Connection is broken for AppendEntry RPC response")
@@ -805,7 +831,7 @@ func (c *ClientInfo) startElection(term int) {
 				// message = append(message, byte(MSG_DELIM))
 				// c.writeToConnection(c.ClientName, connection, message, fmt.Sprintf("RequestVote RPC with data: %+v", requestData))
 
-				c.sendRPC(REQUESTVOTE_REQ, &requestData, connection, fmt.Sprintf("RequestVote RPC with data: %+v", requestData), clientName)
+				c.SendRPC(REQUESTVOTE_REQ, &requestData, connection, fmt.Sprintf("RequestVote RPC with data: %+v", requestData), clientName)
 			}(conn, clientName)
 		}
 	}
@@ -822,22 +848,21 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 				c.Mu.Lock()
 
 				prevLogIndex := c.LastLogIndex - 1
-				var prevLogTerm, commitIndex int
+				var prevLogTerm int
 				if prevLogIndex < 0 {
 					prevLogTerm = 0
-					commitIndex = -1
 				} else {
 					// fetch term from log
 					prevLogTerm = c.ReplicatedLog[prevLogIndex].Term
 
-					for idx, entry := range c.ReplicatedLog {
-						// entry was committed
-						if entry.CommandOutput != "" {
-							commitIndex = idx
-						} else {
-							break
-						}
-					}
+					// for idx, entry := range c.ReplicatedLog {
+					// 	// entry was committed
+					// 	if entry.CommandOutput != "" {
+					// 		commitIndex = idx
+					// 	} else {
+					// 		break
+					// 	}
+					// }
 				}
 
 				requestData := AppendEntryRequest{
@@ -846,7 +871,7 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 					PrevLogIndex: prevLogIndex,
 					PrevLogTerm:  prevLogTerm,
 					Entries:      nil, // Entries being nil means heartbeat
-					CommitIndex:  commitIndex,
+					CommitIndex:  c.CommitIndex,
 				}
 				c.Mu.Unlock()
 
@@ -855,7 +880,7 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 				// message = append(message, byte(MSG_DELIM))
 
 				// c.writeToConnection(c.ClientName, connection, message, fmt.Sprintf("AppendEntry RPC with data: %+v", requestData))
-				c.sendRPC(APPENDENTRIES_REQ, &requestData, connection, fmt.Sprintf("AppendEntry RPC with data: %+v", requestData), clientName)
+				c.SendRPC(APPENDENTRIES_REQ, &requestData, connection, fmt.Sprintf("AppendEntry RPC with data: %+v", requestData), clientName)
 			}(conn, clientName)
 		}
 	}
@@ -890,6 +915,9 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 		if err != nil {
 			c.ConnLogger.Printf("Inbound connection from client %s has disconnected\n", clientName)
 			// TODO: handle disconnect ... (don't change leader if dc'd was leader but modify the outgoing connections and break out of loop)
+
+			connection.Close()
+			c.InboundConns.Set(clientName, nil)
 			break
 		}
 
@@ -898,9 +926,9 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 		id := parse[0]
 		data := parse[1]
 
-		c.ConnLogger.Printf("Received command [%s] from %s with data [%s]\n", strings.ToUpper(id), clientName, data)
-
 		idInt, _ := strconv.Atoi(id)
+		c.ConnLogger.Printf("Received command [%s] from %s with data [%s]\n", Rpc(idInt), clientName, data)
+
 		c.reqChan(Rpc(idInt), []byte(data))
 	}
 }
@@ -937,7 +965,7 @@ func (c *ClientInfo) reqChan(id Rpc, b []byte) {
 		
 		if c.getRole() == LEADER {
 			data.Demarshal(b)
-			c.submit(data)
+			c.Submit(data)
 		} else {
 			c.CommandLogger.Printf("Client isn't leader, command [%+v] ignored\n", data)
 		}
@@ -950,7 +978,7 @@ func newElectionTimer(rand *rand.Rand, minTime time.Duration) (<-chan time.Time,
 	return time.After(minTime + extra), minTime + extra
 }
 
-func (c *ClientInfo) sendRPC(reqId Rpc, data Marshaller, connection net.Conn, errMsg string, outBoundClientName string) {
+func (c *ClientInfo) SendRPC(reqId Rpc, data Marshaller, connection net.Conn, errMsg string, outBoundClientName string) {
 	message := []byte(string(strconv.Itoa(int(reqId)) + DELIM))
 	message = append(message, data.Marshal()...)
 	message = append(message, byte(MSG_DELIM))
@@ -977,7 +1005,7 @@ func (c *ClientInfo) handleWriteError(err error, errMessage string, connection n
 }
 
 // Submits the command to the log if client is leader
-func (c *ClientInfo) submit(command RawCommand) {
+func (c *ClientInfo) Submit(command RawCommand) bool {
 	c.Mu.Lock()
 	defer c.Mu.Unlock()
 
@@ -985,34 +1013,42 @@ func (c *ClientInfo) submit(command RawCommand) {
 		logEntry := c.handleRawCommand(command)
 		
 		// Check if command has already been submitted to the log (server crashed before response was sent to client)
-		present, output := false, ""
+		present := false
 		for _, entry := range c.ReplicatedLog {
 			if command.CommandId == entry.CommandId {
 				present = true
-				if entry.CommandOutput != "" {
-					output = entry.CommandOutput
-				}
 
 				break
 			}
 		}
 
-		if present && output != "" {
-			// TODO: send message back to client with contents and ignore the command
-			c.CommandLogger.Printf("TODO: send message back to client with contents and ignore the command\n")
-		} else if present {
+		// if present && output != "" {
+		// 	c.CommandLogger.Printf("OOPS: this should never happen...\n")
+		if present {
 			c.CommandLogger.Printf("Command has already been added to the log but has not yet been committed, ignore command\n")
 		} else {
 			c.ReplicatedLog = append(c.ReplicatedLog, logEntry)
-			c.ElecLogger.Printf("LogEntry [%+v] saved locally with term=%d and previous index=%d\n", logEntry, c.CurrentTerm, c.LastLogIndex)
+			c.CommandLogger.Printf("LogEntry [%+v] saved locally with term=%d and previous index=%d\n", logEntry, c.CurrentTerm, c.LastLogIndex)
+			c.LastLogIndex++
 		}
 
+		return true
 		// TODO: persist log on disk
+	} else {
+		return false
 	}
 }
 
 // This function processes the command and generates the log entry. ASSUMPTION: happens under a mutex lock
 func (c *ClientInfo) handleRawCommand(command RawCommand) LogEntry {
 	// TODO: IAN - handle command, create a LogEntry struct and return it
-	return LogEntry{}
+	return LogEntry{
+		Term: c.CurrentTerm,
+		Action: command.Action,
+		CommandId: command.CommandId,
+
+		LogGetCommand: LogGetCommand{},
+		LogPutCommand: LogPutCommand{},
+		LogCreateCommand: LogCreateCommand{},
+	}
 }
