@@ -14,6 +14,7 @@ import (
 	"time"
 
 	crypto "example/users/client/crypto"
+	dictionary "example/users/client/dictionary"
 	disk "example/users/client/disk"
 	storage "example/users/client/storage"
 )
@@ -43,23 +44,23 @@ const (
 )
 
 const (
-	DELIM = "*"
-	TIMEOUT = 7
-	MAJORITY = 3
+	DELIM     = "*"
+	TIMEOUT   = 7
+	MAJORITY  = 3
 	MSG_DELIM = '@'
 )
 
 // implement ToString
 func (r Role) String() string {
 	switch r {
-		case FOLLOWER:
-			return "Follower"
-		case LEADER:
-			return "Leader"
-		case CANDIDATE:
-			return "Candidate"
-		default:
-			return "Unknown"
+	case FOLLOWER:
+		return "Follower"
+	case LEADER:
+		return "Leader"
+	case CANDIDATE:
+		return "Candidate"
+	default:
+		return "Unknown"
 	}
 }
 
@@ -70,22 +71,22 @@ type ClientInfo struct {
 	OutboundConns storage.ConnStorage // outbound connections to other servers
 	InboundConns  storage.ConnStorage // inbound connections from other servers
 	CurrentTerm   int                 // current leader term
-	LastLogIndex  int				  // index of latest entry in the log
-	LastLogTerm   int				  // term of the latest entry in the log
+	LastLogIndex  int                 // index of latest entry in the log
+	LastLogTerm   int                 // term of the latest entry in the log
 	ReplicatedLog []LogEntry          // log entries, read from the disk
 	VotedFor      string              // name of client voted for leader
 	CurrentRole   Role                // 1: follower / 2: leader / 3: candidate
-	CurrentLeader LeaderInfo	      // information of the current leader
+	CurrentLeader LeaderInfo          // information of the current leader
 	VotesReceived []string            // names of channels whose vote were received
 	Mu            *sync.Mutex
-	LogStore      disk.LogStore        // interact to store logs and other info on disk
+	LogStore      disk.LogStore // interact to store logs and other info on disk
 
 	// TODO: StateMachine storage.ReplicatedDictOfDicts
-	Faillinks     map[string]net.Conn // Stop sending messages to and ignores messages received from the connections here
-	Keys		  crypto.Keys         // public and private keys
-	DiskLogger	  *log.Logger         // logs information about AppendEntry RPCs and commits to the state machine
-	ElecLogger    *log.Logger		  // logs information about Election RPCs and leader changes
-	ConnLogger    *log.Logger         // logs information about outgoing and ingoing messages on connections, and connection disconnects
+	Faillinks  map[string]net.Conn // Stop sending messages to and ignores messages received from the connections here
+	Keys       crypto.Keys         // public and private keys
+	DiskLogger *log.Logger         // logs information about AppendEntry RPCs and commits to the state machine
+	ElecLogger *log.Logger         // logs information about Election RPCs and leader changes
+	ConnLogger *log.Logger         // logs information about outgoing and ingoing messages on connections, and connection disconnects
 
 	// LastContact   time.Time           // tracks last contact with the leader
 
@@ -96,7 +97,11 @@ type ClientInfo struct {
 	AppendEntryResponseChan chan AppendEntryResponse
 
 	// Random number generator
-	r             *rand.Rand
+	r *rand.Rand
+
+	// List of dictionary
+	DictCounter int
+	DictList    []dictionary.Dictionary
 }
 
 type LogEntry struct {
@@ -107,8 +112,8 @@ type LogEntry struct {
 }
 
 type Command struct {
-	Key string
-	Value string
+	Key    string
+	Value  string
 	Action Action
 }
 
@@ -119,8 +124,8 @@ type ConnectionInfo struct {
 
 type LeaderInfo struct {
 	NoLeader           bool
-	Mu         		   *sync.Mutex
-	ClientName 		   string      // A, B, C, D, E
+	Mu                 *sync.Mutex
+	ClientName         string // A, B, C, D, E
 	InboundConnection  net.Conn
 	OutboundConnection net.Conn
 }
@@ -128,7 +133,7 @@ type LeaderInfo struct {
 // PROTOCOL: [identifier:marshalled byte slice]
 type Marshaller interface {
 	Marshal() []byte
-	Demarshal([]byte) 
+	Demarshal([]byte)
 }
 
 // TODO: declare struct types for PROTOCOL information msgs (should implement the Marshaller interface)
@@ -265,7 +270,7 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.ReplicatedLog = make([]LogEntry, 0)
 	c.VotedFor = ""
 	c.CurrentRole = FOLLOWER
-	c.CurrentLeader = LeaderInfo{ false, leaderInfoMu, "", nil, nil }
+	c.CurrentLeader = LeaderInfo{false, leaderInfoMu, "", nil, nil}
 	c.VotesReceived = make([]string, 0)
 	c.Mu = clientMu
 	c.LogStore = disk.LogStore{} // TODO
@@ -284,6 +289,11 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	// set up RNG
 	generator := rand.NewSource(processID)
 	c.r = rand.New(generator)
+
+	// set up dictionary list
+	c.DictCounter = 0
+	c.DictList = make([]dictionary.Dictionary, 0)
+
 }
 
 // Recover client information after crashing
@@ -329,7 +339,7 @@ func (c *ClientInfo) setupFollower() int {
 func (c *ClientInfo) follower() {
 	c.ElecLogger.Printf("State: FOLLOWER\n")
 	// start election timer, reset election timeout
-	timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
+	timer, duration := newElectionTimer(c.r, TIMEOUT*time.Second)
 	// c.LastContact = time.Now()
 
 	currentTerm := c.setupFollower()
@@ -338,7 +348,7 @@ func (c *ClientInfo) follower() {
 
 	for c.getRole() == FOLLOWER {
 		select {
-		case <- timer:
+		case <-timer:
 			// c.ElecLogger.Printf("Election timeout ended, checking if heartbeat received from leader\n")
 
 			// // check for timeout, if timeout was received, we start
@@ -349,10 +359,10 @@ func (c *ClientInfo) follower() {
 			// } else {
 			c.ElecLogger.Printf("AppendEntry heartbeat wasn't received before timeout on term=%d, promoting self to CANDIDATE\n", currentTerm)
 			c.setRole(CANDIDATE)
-				// c.Mu.Unlock()
+			// c.Mu.Unlock()
 			// }
 		// Resets timer only if vote is successfully granted to CANDIDATE
-		case request := <- c.ReqVoteRequestChan:
+		case request := <-c.ReqVoteRequestChan:
 			c.ElecLogger.Printf("RequestVote request received from CANDIDIATE %s for term=%d, our term=%d\n", request.CandidateName, request.CandidateTerm, currentTerm)
 
 			var responseData RequestVoteResponse
@@ -370,8 +380,8 @@ func (c *ClientInfo) follower() {
 			if request.CandidateTerm == currentTerm && (c.VotedFor == "" || c.VotedFor == request.CandidateName) {
 				c.VotedFor = request.CandidateName
 				responseData.VoteGranted = true
-				
-				timer, _ = newElectionTimer(c.r, TIMEOUT * time.Second)
+
+				timer, _ = newElectionTimer(c.r, TIMEOUT*time.Second)
 				c.ElecLogger.Printf("Voted for CANDIDATE %s, election timeout reset with duration %v, term=%d\n", request.CandidateName, duration, currentTerm)
 			} else {
 				c.ElecLogger.Printf("Did not vote for CANDIDATE %s, election timeout not reset, term=%d\n", request.CandidateName, currentTerm)
@@ -387,8 +397,8 @@ func (c *ClientInfo) follower() {
 				panic("Connection is broken for RequestVote RPC response")
 			}
 		// Respond to AppendEntry request and reset timer
-		case request := <- c.AppendEntryRequestChan:
-			timer, duration = newElectionTimer(c.r, TIMEOUT * time.Second)
+		case request := <-c.AppendEntryRequestChan:
+			timer, duration = newElectionTimer(c.r, TIMEOUT*time.Second)
 			c.ElecLogger.Printf("AppendEntry request received, election timeout reset with duration %v, term=%d\n", duration, currentTerm)
 
 			var responseData AppendEntryResponse
@@ -399,15 +409,15 @@ func (c *ClientInfo) follower() {
 			if request.Term < currentTerm {
 				c.ElecLogger.Printf("LEADER's term=%d is out of date (our term=%d), no action will be taken\n", request.Term, currentTerm)
 				responseData.NewTerm = currentTerm
-			// LEADER term matches our term
+				// LEADER term matches our term
 			} else if request.Term == currentTerm {
 				// TODO: after we finish leader election
 				c.ElecLogger.Printf("LEADER's term=%d is same as our term, we love our LEADER %s <3\n", request.Term, request.LeaderName)
 				responseData.NewTerm = currentTerm
 				responseData.Success = true
-				
+
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
-			// LEADER is more up to date than us
+				// LEADER is more up to date than us
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, updating our term\n", request.Term, currentTerm)
 				responseData.NewTerm = request.Term
@@ -442,7 +452,7 @@ func (c *ClientInfo) candidate() {
 		c.ElecLogger.Printf("Beginning new election with term %d\n", c.CurrentTerm)
 		c.Mu.Unlock()
 
-		timer, duration := newElectionTimer(c.r, TIMEOUT * time.Second)
+		timer, duration := newElectionTimer(c.r, TIMEOUT*time.Second)
 		// c.LastContact = time.Now()
 		c.ElecLogger.Printf("Election timeout started with duration %v, term=%d\n", duration, tmpTerm)
 
@@ -451,16 +461,16 @@ func (c *ClientInfo) candidate() {
 
 	timer, tmpTerm := prepareElection()
 	c.startElection(tmpTerm)
-	
+
 	for c.getRole() == CANDIDATE {
 		select {
-		case <- timer:
+		case <-timer:
 			c.ElecLogger.Printf("Election timeout ended for term=%d, restarting election\n", tmpTerm)
-			
+
 			timer, tmpTerm = prepareElection()
 			c.startElection(tmpTerm)
 		// Another CANDIDATE is requesting an election, would be nice if we cared...
-		case request := <- c.ReqVoteRequestChan:
+		case request := <-c.ReqVoteRequestChan:
 			c.ElecLogger.Printf("RequestVote request received from CANDIDIATE %s for term=%d, our term=%d\n", request.CandidateName, request.CandidateTerm, tmpTerm)
 
 			var responseData RequestVoteResponse
@@ -479,7 +489,7 @@ func (c *ClientInfo) candidate() {
 			if request.CandidateTerm == tmpTerm && (c.VotedFor == "" || c.VotedFor == request.CandidateName) {
 				c.VotedFor = request.CandidateName
 				responseData.VoteGranted = true
-				
+
 				// timer, _ = newElectionTimer(c.r, TIMEOUT * time.Second)
 				c.ElecLogger.Printf("Stepped down as CANDIDATE because our term is behind, voted for CANDIDATE %s, term=%d\n", request.CandidateName, tmpTerm)
 			} else {
@@ -497,7 +507,7 @@ func (c *ClientInfo) candidate() {
 			}
 			// fmt.Println("Done sending RPC!")
 		// Receive RPC requests, LEADER revived or someone else already won the election
-		case request := <- c.AppendEntryRequestChan:
+		case request := <-c.AppendEntryRequestChan:
 			c.ElecLogger.Printf("AppendEntry request received on term=%d\n", tmpTerm)
 
 			var responseData AppendEntryResponse
@@ -508,15 +518,15 @@ func (c *ClientInfo) candidate() {
 			if request.Term < tmpTerm {
 				c.ElecLogger.Printf("LEADER's term=%d is out of date (our term=%d), no action will be taken\n", request.Term, tmpTerm)
 				responseData.NewTerm = tmpTerm
-			// LEADER term matches our term, become FOLLOWER
+				// LEADER term matches our term, become FOLLOWER
 			} else if request.Term == tmpTerm {
 				c.ElecLogger.Printf("LEADER's term=%d is same as our term, stepping down\n", request.Term)
 				responseData.NewTerm = tmpTerm
 				responseData.Success = true
-				
+
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
-			// LEADER is more up to date than us, become FOLLOWER
+				// LEADER is more up to date than us, become FOLLOWER
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, stepping down\n", request.Term, tmpTerm)
 				responseData.NewTerm = request.Term
@@ -537,14 +547,14 @@ func (c *ClientInfo) candidate() {
 				panic("Connection is broken for AppendEntry RPC response")
 			}
 		// Respond to vote from server
-		case reply := <- c.ReqVoteResponseChan:
+		case reply := <-c.ReqVoteResponseChan:
 			c.ElecLogger.Printf("RequestVote RPC response received during current term=%d, client=%s\n", tmpTerm, reply.ClientName)
 
 			newState := c.getRole()
 			if newState != CANDIDATE {
 				c.ElecLogger.Printf("State %s is no longer CANDIDATE (probably shouldn't happen)\n", newState.String())
 
-				return 
+				return
 			}
 
 			// c.Mu.Lock()
@@ -594,14 +604,14 @@ func (c *ClientInfo) leader() {
 	for c.getRole() == LEADER {
 		select {
 		// send out AppendEntry RPC
-		case <- heartbeat.C:
+		case <-heartbeat.C:
 			c.sendHeartBeat(tmpTerm)
-		case reply := <- c.AppendEntryResponseChan:
+		case reply := <-c.AppendEntryResponseChan:
 			c.ElecLogger.Printf("AppendEntry RPC response received for term=%d\n", tmpTerm)
 
 			if reply.NewTerm > tmpTerm {
 				c.ElecLogger.Printf("Received term=%d is higher than our term=%d, stepping down\n", reply.NewTerm, tmpTerm)
-				
+
 				c.Mu.Lock()
 				c.CurrentTerm = reply.NewTerm
 				c.Mu.Unlock()
@@ -609,7 +619,7 @@ func (c *ClientInfo) leader() {
 				c.CurrentLeader.clearLeader() // c.CurrentLeader will be set eventually when AppendEntry RPC requests come in
 				c.setRole(FOLLOWER)
 			}
-		case request := <- c.ReqVoteRequestChan:
+		case request := <-c.ReqVoteRequestChan:
 			c.ElecLogger.Printf("RequestVote request received from CANDIDIATE %s for term=%d, our term=%d\n", request.CandidateName, request.CandidateTerm, tmpTerm)
 
 			var responseData RequestVoteResponse
@@ -628,7 +638,7 @@ func (c *ClientInfo) leader() {
 			if request.CandidateTerm == tmpTerm && (c.VotedFor == "" || c.VotedFor == request.CandidateName) {
 				c.VotedFor = request.CandidateName
 				responseData.VoteGranted = true
-				
+
 				// timer, _ = newElectionTimer(c.r, TIMEOUT * time.Second)
 				c.ElecLogger.Printf("Stepped down as LEADER because our term is behind, voted for CANDIDATE %s, term=%d\n", request.CandidateName, tmpTerm)
 			} else {
@@ -644,7 +654,7 @@ func (c *ClientInfo) leader() {
 			} else {
 				panic("Connection is broken for RequestVote RPC response")
 			}
-		case request := <- c.AppendEntryRequestChan:
+		case request := <-c.AppendEntryRequestChan:
 			c.ElecLogger.Printf("AppendEntry request received on term=%d\n", tmpTerm)
 
 			var responseData AppendEntryResponse
@@ -655,15 +665,15 @@ func (c *ClientInfo) leader() {
 			if request.Term < tmpTerm {
 				c.ElecLogger.Printf("LEADER's term=%d is out of date (our term=%d), tell LEADER to step down\n", request.Term, tmpTerm)
 				responseData.NewTerm = tmpTerm
-			// LEADER term matches our term, become FOLLOWER
+				// LEADER term matches our term, become FOLLOWER
 			} else if request.Term == tmpTerm {
 				c.ElecLogger.Printf("LEADER's term=%d is same as our term, stepping down\n", request.Term)
 				responseData.NewTerm = tmpTerm
 				responseData.Success = true
-				
+
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
-			// LEADER is more up to date than us, become FOLLOWER
+				// LEADER is more up to date than us, become FOLLOWER
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, stepping down\n", request.Term, tmpTerm)
 				responseData.NewTerm = request.Term
@@ -701,15 +711,15 @@ func (c *ClientInfo) startElection(term int) {
 		conn, exists := c.OutboundConns.Get(clientName)
 
 		if exists {
-			go func(connection net.Conn, clientName string){
+			go func(connection net.Conn, clientName string) {
 				c.ElecLogger.Printf("Sending RequestVote RPC to client: %s\n", clientName)
 
 				c.Mu.Lock()
-				requestData := RequestVoteRequest {
+				requestData := RequestVoteRequest{
 					CandidateName: c.ClientName,
 					CandidateTerm: term,
-					LastLogIndex: c.LastLogIndex,
-					LastLogTerm: c.LastLogTerm,
+					LastLogIndex:  c.LastLogIndex,
+					LastLogTerm:   c.LastLogTerm,
 				}
 
 				c.Mu.Unlock()
@@ -720,7 +730,7 @@ func (c *ClientInfo) startElection(term int) {
 				// message = append(message, byte(MSG_DELIM))
 				// c.writeToConnection(c.ClientName, connection, message, fmt.Sprintf("RequestVote RPC with data: %+v", requestData))
 
-				c.sendRPC(REQUESTVOTE_REQ, &requestData, connection, fmt.Sprintf("RequestVote RPC with data: %+v", requestData), clientName)	
+				c.sendRPC(REQUESTVOTE_REQ, &requestData, connection, fmt.Sprintf("RequestVote RPC with data: %+v", requestData), clientName)
 			}(conn, clientName)
 		}
 	}
@@ -744,7 +754,7 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 				} else {
 					// fetch term from log
 					prevLogTerm = c.ReplicatedLog[prevLogIndex].Term
-					
+
 					for idx, entry := range c.ReplicatedLog {
 						if entry.Committed {
 							commitIndex = idx
@@ -754,13 +764,13 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 					}
 				}
 
-				requestData := AppendEntryRequest {
-					Term: term, 
-					LeaderName: c.ClientName,
+				requestData := AppendEntryRequest{
+					Term:         term,
+					LeaderName:   c.ClientName,
 					PrevLogIndex: prevLogIndex,
-					PrevLogTerm: prevLogTerm,
-					Entries: nil, // Entries being nil means heartbeat
-					CommitIndex: commitIndex,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      nil, // Entries being nil means heartbeat
+					CommitIndex:  commitIndex,
 				}
 				c.Mu.Unlock()
 
@@ -800,7 +810,7 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 	for {
 		// TODO: receive incoming messages, identify the message type, demarshal into the appropriate data structure, and pass the struct to the appropriate channel for RAFT to handle
 		bytes, err := reader.ReadBytes(MSG_DELIM)
-		
+
 		if err != nil {
 			c.ConnLogger.Printf("Inbound connection from client %s has disconnected\n", clientName)
 			// TODO: handle disconnect ... (don't change leader if dc'd was leader but modify the outgoing connections and break out of loop)
@@ -808,12 +818,12 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 		}
 
 		// parse command identification
-		parse := strings.Split(string(bytes[:len(bytes) - 1]), DELIM)
+		parse := strings.Split(string(bytes[:len(bytes)-1]), DELIM)
 		id := parse[0]
 		data := parse[1]
 
 		c.ConnLogger.Printf("Received command [%s] from %s with data [%s]\n", strings.ToUpper(id), clientName, data)
-		
+
 		idInt, _ := strconv.Atoi(id)
 		c.reqChan(Rpc(idInt), []byte(data))
 	}
