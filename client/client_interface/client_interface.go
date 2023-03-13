@@ -84,24 +84,24 @@ func (r Rpc) String() string {
 
 // Configuration for a client that implements the RAFT consensus algorithm
 type ClientInfo struct {
-	ProcessId     int64               // process ID identifier, for encryption purposes
-	ClientName    string              // name identifier: A, B, C, D, E
-	OutboundConns storage.ConnStorage // outbound connections to other servers
-	InboundConns  storage.ConnStorage // inbound connections from other servers
-	CurrentTerm   int                 // current leader term
-	LastLogIndex  int                 // index of latest entry in the log
-	LastLogTerm   int                 // term of the latest entry in the log
+	ProcessId     int64                // process ID identifier, for encryption purposes
+	ClientName    string               // name identifier: A, B, C, D, E
+	OutboundConns storage.ConnStorage  // outbound connections to other servers
+	InboundConns  storage.ConnStorage  // inbound connections from other servers
+	CurrentTerm   int                  // current leader term
+	NextIndex     storage.StringIntMap // stores index of log entry on destination immediately preceding the new ones we are sending
+	MatchIndex    storage.StringIntMap // 
 
-	CommitIndex   int                 // Furthest known applied commit index across the system
-	LastApplied   int                 // Index of the last applied commit on the current server, used when the server recovers
+	CommitIndex   int                  // Furthest known applied commit index across the system
+	LastApplied   int                  // Index of the last applied commit on the current server, used when the server recovers
 
-	ReplicatedLog []LogEntry          // log entries, read from the disk
-	VotedFor      string              // name of client voted for leader
-	CurrentRole   Role                // 1: follower / 2: leader / 3: candidate
-	CurrentLeader LeaderInfo          // information of the current leader
-	VotesReceived []string            // names of channels whose vote were received
+	ReplicatedLog []LogEntry           // log entries, read from the disk
+	VotedFor      string               // name of client voted for leader
+	CurrentRole   Role                 // 1: follower / 2: leader / 3: candidate
+	CurrentLeader LeaderInfo           // information of the current leader
+	VotesReceived []string             // names of channels whose vote were received
 	Mu            *sync.Mutex
-	LogStore      disk.LogStore // interact to store logs and other info on disk
+	LogStore      disk.LogStore        // interact to store logs and other info on disk
 
 	// TODO: StateMachine storage.ReplicatedDictOfDicts
 	Faillinks     map[string]net.Conn // Stop sending messages to and ignores messages received from the connections here
@@ -119,9 +119,10 @@ type ClientInfo struct {
 	AppendEntryResponseChan chan AppendEntryResponse
 
 	CommitChan				chan<- LogEntry // Channel that contains LogEntry structs to commit
+	CommitReadyChan         chan struct{}   // Channel that signals commits are ready to be made on LEADER
 
 	// Random number generator
-	r *rand.Rand
+	r           *rand.Rand
 
 	// List of dictionary
 	DictCounter int
@@ -169,11 +170,6 @@ type LogCreateCommand struct {
 }
 // ==========================================================================
 
-type ConnectionInfo struct {
-	Connection net.Conn
-	ClientName string
-}
-
 type LeaderInfo struct {
 	NoLeader           bool
 	Mu                 *sync.Mutex
@@ -189,6 +185,7 @@ type RequestVoteRequest struct {
 	LastLogIndex  int
 	LastLogTerm   int
 }
+
 type RequestVoteResponse struct {
 	NewTerm     int
 	VoteGranted bool
@@ -205,8 +202,10 @@ type AppendEntryRequest struct {
 }
 
 type AppendEntryResponse struct {
-	NewTerm int  // term of self, may be higher than the LEADER who sent the AE RPC
-	Success bool // true if previous entries of FOLLOWER were all committed
+	NewTerm     int  // term of self, may be higher than the LEADER who sent the AE RPC
+	Success     bool // true if previous entries of FOLLOWER were all committed
+	ClientName  string
+	EntryLength int
 }
 
 // Raw commands represent commands sent by the clients over the network, before encryption occurs.
@@ -364,7 +363,7 @@ func (c *ClientInfo) String() string {
 		"Leader: %s\n"+
 		"Outbound connections: %+v\n"+
 		"Inbound connections: %+v\n",
-		c.ProcessId, c.ClientName, c.CurrentTerm, c.VotedFor, c.CurrentRole.String(), c.CurrentLeader.ClientName, c.OutboundConns.Keys(), c.InboundConns.Keys())
+		c.ProcessId, c.ClientName, c.CurrentTerm, c.VotedFor, c.CurrentRole.String(), c.CurrentLeader.ClientName, c.OutboundConns.Keys(false), c.InboundConns.Keys(false))
 }
 
 // Sets up client info upon first initialization of RAFT algorithm
@@ -373,11 +372,11 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.ClientName = name
 	c.OutboundConns = storage.NewConnStorage()
 	c.InboundConns = storage.NewConnStorage()
+	c.NextIndex = storage.NewStringIntMap()
+	c.MatchIndex = storage.NewStringIntMap()
 	c.CurrentTerm = 0
-	c.LastLogIndex = -1
-	c.LastLogTerm = 0
 
-	c.LastApplied = -1
+	c.LastApplied = -1 // LastApplied entry, used in the channel handler
 	c.CommitIndex = -1
 
 	c.ReplicatedLog = make([]LogEntry, 0)
@@ -407,6 +406,7 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.DictCounter = 0
 	c.DictList = make([]dictionary.Dictionary, 0)
 
+	go c.handleCommits()
 }
 
 // Recover client information after crashing
@@ -433,6 +433,30 @@ func (c *ClientInfo) RAFT() {
 			c.candidate()
 		case LEADER:
 			c.leader()
+		}
+	}
+}
+
+// Handles logs that are ready to be commit
+func (c *ClientInfo) handleCommits() {
+	// the for loops blocks until there is a message to receive over c.CommitReadyChan
+	for range c.CommitReadyChan {
+		c.Mu.Lock()
+		// tmpTerm := c.CurrentTerm		
+		// tmpLastAppliedCommit := c.LastApplied
+
+		var commitEntry []LogEntry
+		if c.CommitIndex > c.LastApplied { // LastApplied are the still unapplied commits
+			commitEntry = c.ReplicatedLog[c.LastApplied + 1: c.CommitIndex + 1]
+			c.LastApplied = c.CommitIndex
+		}
+
+		// Find which entries we have to apply
+		c.Mu.Unlock()
+		c.ElecLogger.Printf("Committing entries: %+v\n", commitEntry)
+
+		for _, entry := range commitEntry {
+			c.CommitChan <- entry
 		}
 	}
 }
@@ -534,6 +558,8 @@ func (c *ClientInfo) follower() {
 			}
 
 			if conn != nil {
+				responseData.ClientName = c.ClientName
+				responseData.EntryLength = len(request.Entries)
 				c.SendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
 			} else {
 				// If failed, we don't have to send it over
@@ -644,6 +670,8 @@ func (c *ClientInfo) candidate() {
 			}
 
 			if conn != nil {
+				responseData.ClientName = c.ClientName
+				responseData.EntryLength = len(request.Entries)
 				c.SendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
 			} else {
 				// If failed, we don't have to send it over
@@ -696,6 +724,12 @@ func (c *ClientInfo) leader() {
 	c.VotesReceived = make([]string, 0)
 	// c.VotedFor = ""
 	c.CurrentLeader.setLeader(c.ClientName, nil)
+
+	for _, key := range c.OutboundConns.Keys(true) {
+		c.NextIndex.Set(key, len(c.ReplicatedLog))
+		c.MatchIndex.Set(key, -1)
+	}
+
 	c.Mu.Unlock()
 
 	// start heartbeat timer to send AppendEntry RPC
@@ -707,6 +741,7 @@ func (c *ClientInfo) leader() {
 		// send out AppendEntry RPC
 		case <-heartbeat.C:
 			c.sendHeartBeat(tmpTerm)
+		// respond to append entry response, commit if ready
 		case reply := <-c.AppendEntryResponseChan:
 			c.ElecLogger.Printf("AppendEntry RPC response received for term=%d\n", tmpTerm)
 
@@ -719,6 +754,45 @@ func (c *ClientInfo) leader() {
 
 				c.CurrentLeader.clearLeader() // c.CurrentLeader will be set eventually when AppendEntry RPC requests come in
 				c.setRole(FOLLOWER)
+			} else if c.getRole() == LEADER && tmpTerm == reply.NewTerm {
+				nextIndex, _ := c.NextIndex.Get(reply.ClientName)
+				if reply.Success {
+					c.NextIndex.Set(reply.ClientName, nextIndex + reply.EntryLength)
+					c.MatchIndex.Set(reply.ClientName, nextIndex + reply.EntryLength - 1)
+					
+					c.ElecLogger.Printf("AppendEntry RPC from %s is successful: nextIndex=%d, matchIndex=%d\n", reply.ClientName, nextIndex + reply.EntryLength, nextIndex + reply.EntryLength - 1)
+					
+					// see if entries are ready to be committed
+					savedCommitIndex := c.CommitIndex
+					for i := c.CommitIndex + 1; i < len(c.ReplicatedLog); i++ {
+						// only commit terms in the current index safely (exercise caution when committing terms in previous indexes)
+						if c.ReplicatedLog[i].Term == c.CurrentTerm {
+							matchCount := 1
+							
+							// commit logs that were replicated to a majority of followers
+							for _, clientName := range c.OutboundConns.Keys(false) {
+								if lastMatchedLogIndex, _ := c.MatchIndex.Get(clientName); lastMatchedLogIndex >= i {
+									matchCount++	
+								}
+							}
+
+							if matchCount >= MAJORITY {
+								c.CommitIndex = i
+							}
+						}
+					}
+
+					// New thngs should be committed based on response from log, signal commit channel, as commits may take time
+					if savedCommitIndex != c.CommitIndex {
+						c.ElecLogger.Printf("LEADER is committing log entries from indexes %d to %d\n", savedCommitIndex + 1, c.CommitIndex)
+						c.CommitReadyChan <- struct{}{} // signal new commits are ready
+					}
+				} else {
+					 // again, nextIndex represents the "unique value" that hasn't been overwritten by the log
+					c.NextIndex.Set(reply.ClientName, nextIndex - 1) // decrease it by one, see if we can apply our log by one more entry the next time
+
+					c.ElecLogger.Printf("AppendEntry RPC didn't update the logs properly, decrease by 1, retrying\n")
+				}
 			}
 		case request := <-c.ReqVoteRequestChan:
 			c.ElecLogger.Printf("RequestVote request received from CANDIDIATE %s for term=%d, our term=%d\n", request.CandidateName, request.CandidateTerm, tmpTerm)
@@ -764,7 +838,7 @@ func (c *ClientInfo) leader() {
 
 			// LEADER term is out of date (and other LEADER should step down)
 			if request.Term < tmpTerm {
-				c.ElecLogger.Printf("LEADER's term=%d is out of date (our term=%d), tell LEADER to step down\n", request.Term, tmpTerm)
+				c.ElecLogger.Printf("Other LEADER's term=%d is out of date (our term=%d), tell LEADER to step down\n", request.Term, tmpTerm)
 				responseData.NewTerm = tmpTerm
 				// LEADER term matches our term, become FOLLOWER
 			} else if request.Term == tmpTerm {
@@ -789,6 +863,8 @@ func (c *ClientInfo) leader() {
 			}
 
 			if conn != nil {
+				responseData.ClientName = c.ClientName
+				responseData.EntryLength = len(request.Entries)
 				c.SendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
 			} else {
 				// If failed, we don't have to send it over
@@ -808,7 +884,7 @@ func (c *ClientInfo) startElection(term int) {
 
 	// fmt.Println("before check range out keys")
 	// send RequestVote RPC to outbound connections
-	for _, clientName := range c.OutboundConns.Keys() {
+	for _, clientName := range c.OutboundConns.Keys(false) {
 		conn, exists := c.OutboundConns.Get(clientName)
 
 		if exists {
@@ -816,20 +892,14 @@ func (c *ClientInfo) startElection(term int) {
 				c.ElecLogger.Printf("Sending RequestVote RPC to client: %s\n", clientName)
 
 				c.Mu.Lock()
+				lastLogIndex, lastLogTerm := c.getLastIndexAndTerm()
 				requestData := RequestVoteRequest{
 					CandidateName: c.ClientName,
 					CandidateTerm: term,
-					LastLogIndex:  c.LastLogIndex,
-					LastLogTerm:   c.LastLogTerm,
+					LastLogIndex:  lastLogIndex,
+					LastLogTerm:   lastLogTerm,
 				}
-
 				c.Mu.Unlock()
-
-				// message := []byte(string(strconv.Itoa(int(REQUESTVOTE_REQ)) + DELIM))
-				// // fmt.Println(string(strconv.Itoa(int(REQUESTVOTE_REQ)) + DELIM)
-				// message = append(message, requestData.Marshal()...)
-				// message = append(message, byte(MSG_DELIM))
-				// c.writeToConnection(c.ClientName, connection, message, fmt.Sprintf("RequestVote RPC with data: %+v", requestData))
 
 				c.SendRPC(REQUESTVOTE_REQ, &requestData, connection, fmt.Sprintf("RequestVote RPC with data: %+v", requestData), clientName)
 			}(conn, clientName)
@@ -838,7 +908,7 @@ func (c *ClientInfo) startElection(term int) {
 }
 
 func (c *ClientInfo) sendHeartBeat(term int) {
-	for _, clientName := range c.OutboundConns.Keys() {
+	for _, clientName := range c.OutboundConns.Keys(false) {
 		conn, exists := c.OutboundConns.Get(clientName)
 
 		if exists {
@@ -846,40 +916,26 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 				c.ElecLogger.Printf("Sending AppendEntry RPC to client: %s\n", clientName)
 
 				c.Mu.Lock()
+				nextIndex, _ := c.NextIndex.Get(clientName) // next index should be the latest "unique" entry on the destination's log
+				lastMatchingIndex := nextIndex - 1 // the last index on the destination where we are sure its log entry matches ours
+				prevLogTerm := -1
 
-				prevLogIndex := c.LastLogIndex - 1
-				var prevLogTerm int
-				if prevLogIndex < 0 {
-					prevLogTerm = 0
-				} else {
-					// fetch term from log
-					prevLogTerm = c.ReplicatedLog[prevLogIndex].Term
-
-					// for idx, entry := range c.ReplicatedLog {
-					// 	// entry was committed
-					// 	if entry.CommandOutput != "" {
-					// 		commitIndex = idx
-					// 	} else {
-					// 		break
-					// 	}
-					// }
+				if lastMatchingIndex >= 0 {
+					prevLogTerm = c.ReplicatedLog[lastMatchingIndex].Term
 				}
+
+				entries := c.ReplicatedLog[nextIndex:] // new entries to send, should replace whatever is on the FOLLOWER's log past this point
 
 				requestData := AppendEntryRequest{
 					Term:         term,
 					LeaderName:   c.ClientName,
-					PrevLogIndex: prevLogIndex,
+					PrevLogIndex: lastMatchingIndex,
 					PrevLogTerm:  prevLogTerm,
-					Entries:      nil, // Entries being nil means heartbeat
+					Entries:      entries, // Entries being empty means heartbeat only
 					CommitIndex:  c.CommitIndex,
 				}
 				c.Mu.Unlock()
 
-				// message := []byte(string(strconv.Itoa(int(APPENDENTRIES_REQ)) + DELIM))
-				// message = append(message, requestData.Marshal()...)
-				// message = append(message, byte(MSG_DELIM))
-
-				// c.writeToConnection(c.ClientName, connection, message, fmt.Sprintf("AppendEntry RPC with data: %+v", requestData))
 				c.SendRPC(APPENDENTRIES_REQ, &requestData, connection, fmt.Sprintf("AppendEntry RPC with data: %+v", requestData), clientName)
 			}(conn, clientName)
 		}
@@ -1022,14 +1078,12 @@ func (c *ClientInfo) Submit(command RawCommand) bool {
 			}
 		}
 
-		// if present && output != "" {
-		// 	c.CommandLogger.Printf("OOPS: this should never happen...\n")
+		// Assume that the edge case where command has already been committed but response isn't received doesn't happen
 		if present {
 			c.CommandLogger.Printf("Command has already been added to the log but has not yet been committed, ignore command\n")
 		} else {
 			c.ReplicatedLog = append(c.ReplicatedLog, logEntry)
-			c.CommandLogger.Printf("LogEntry [%+v] saved locally with term=%d and previous index=%d\n", logEntry, c.CurrentTerm, c.LastLogIndex)
-			c.LastLogIndex++
+			c.CommandLogger.Printf("LogEntry [%+v] saved locally for term=%d\n", logEntry, c.CurrentTerm)
 		}
 
 		return true
@@ -1050,5 +1104,15 @@ func (c *ClientInfo) handleRawCommand(command RawCommand) LogEntry {
 		LogGetCommand: LogGetCommand{},
 		LogPutCommand: LogPutCommand{},
 		LogCreateCommand: LogCreateCommand{},
+	}
+}
+
+// ASSUMPTION: happens under a mutex lock
+func (c *ClientInfo) getLastIndexAndTerm() (int, int) {
+	if len(c.ReplicatedLog) > 0 {
+		lastIndex := len(c.ReplicatedLog) - 1
+		return lastIndex, c.ReplicatedLog[lastIndex].Term
+	} else {
+		return -1, -1
 	}
 }
