@@ -687,7 +687,6 @@ func (c *ClientInfo) candidate() {
 				c.VotedFor = request.CandidateName
 				responseData.VoteGranted = true
 
-				// timer, _ = newElectionTimer(c.r, TIMEOUT * time.Second)
 				c.ElecLogger.Printf("Stepped down as CANDIDATE because our term is behind, voted for CANDIDATE %s, term=%d\n", request.CandidateName, tmpTerm)
 			} else {
 				c.ElecLogger.Printf("Remain as CANDIDATE, did not vote for CANDIDATE %s, term=%d\n", request.CandidateName, tmpTerm)
@@ -885,7 +884,6 @@ func (c *ClientInfo) leader() {
 				c.VotedFor = request.CandidateName
 				responseData.VoteGranted = true
 
-				// timer, _ = newElectionTimer(c.r, TIMEOUT * time.Second)
 				c.ElecLogger.Printf("Stepped down as LEADER because our term is behind, voted for CANDIDATE %s, term=%d\n", request.CandidateName, tmpTerm)
 			} else {
 				c.ElecLogger.Printf("Remain as LEADER, did not vote for CANDIDATE %s, term=%d\n", request.CandidateName, tmpTerm)
