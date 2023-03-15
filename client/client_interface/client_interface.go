@@ -46,7 +46,7 @@ const (
 
 const (
 	DELIM     = "*"
-	TIMEOUT   = 7
+	TIMEOUT   = 10
 	MAJORITY  = 3
 	MSG_DELIM = '@'
 )
@@ -92,8 +92,8 @@ type ClientInfo struct {
 	NextIndex     storage.StringIntMap // stores index of log entry on destination immediately preceding the new ones we are sending
 	MatchIndex    storage.StringIntMap // 
 
-	CommitIndex   int                  // Furthest known applied commit index across the system
-	LastApplied   int                  // Index of the last applied commit on the current server, used when the server recovers
+	CommitIndex   int                  // Furthest known index of commit
+	LastApplied   int                  // Index of the last applied commit on the current server, used when commits are processed
 
 	ReplicatedLog []LogEntry           // log entries, read from the disk
 	VotedFor      string               // name of client voted for leader
@@ -118,7 +118,7 @@ type ClientInfo struct {
 	AppendEntryRequestChan  chan AppendEntryRequest
 	AppendEntryResponseChan chan AppendEntryResponse
 
-	CommitChan				chan<- LogEntry // Channel that contains LogEntry structs to commit
+	CommitChan				chan<- struct{} // Channel that signals commits have finished to the client making the req
 	CommitReadyChan         chan struct{}   // Channel that signals commits are ready to be made on LEADER
 
 	// Random number generator
@@ -367,7 +367,7 @@ func (c *ClientInfo) String() string {
 }
 
 // Sets up client info upon first initialization of RAFT algorithm
-func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex, leaderInfoMu *sync.Mutex) {
+func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex, leaderInfoMu *sync.Mutex, commits chan<- struct{}) {
 	c.ProcessId = processID
 	c.ClientName = name
 	c.OutboundConns = storage.NewConnStorage()
@@ -397,6 +397,8 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.ReqVoteResponseChan = make(chan RequestVoteResponse)
 	c.AppendEntryRequestChan = make(chan AppendEntryRequest)
 	c.AppendEntryResponseChan = make(chan AppendEntryResponse)
+	c.CommitReadyChan = make(chan struct{})
+	c.CommitChan = commits
 
 	// set up RNG
 	generator := rand.NewSource(processID)
@@ -442,8 +444,6 @@ func (c *ClientInfo) handleCommits() {
 	// the for loops blocks until there is a message to receive over c.CommitReadyChan
 	for range c.CommitReadyChan {
 		c.Mu.Lock()
-		// tmpTerm := c.CurrentTerm		
-		// tmpLastAppliedCommit := c.LastApplied
 
 		var commitEntry []LogEntry
 		if c.CommitIndex > c.LastApplied { // LastApplied are the still unapplied commits
@@ -456,9 +456,25 @@ func (c *ClientInfo) handleCommits() {
 		c.ElecLogger.Printf("Committing entries: %+v\n", commitEntry)
 
 		for _, entry := range commitEntry {
-			c.CommitChan <- entry
+			c.businessLogicApply(entry)
+			// c.CommitChan <- struct{}{}
 		}
 	}
+}
+
+// Perform operations on committed log entries, returns a string to be printed
+func (c *ClientInfo) businessLogicApply(logEntry LogEntry) {
+	c.ElecLogger.Printf("Running business logic for commit with CommandId=%s\n", logEntry.CommandId)
+	// TODO: Ian - run business logic and generate message to print
+	msg := "temp"
+	clientID := strings.Split(logEntry.CommandId, DELIM)[0]
+
+	if clientID == c.ClientName {
+		fmt.Print(msg)
+		c.CommitChan <- struct{}{}
+	}
+	// If self isn't the client that made the request, don't print the output
+	// c.CommitChan <- struct{}{}	
 }
 
 // Prologue to run before becoming a follower
@@ -541,10 +557,12 @@ func (c *ClientInfo) follower() {
 				// TODO: after we finish leader election
 				c.ElecLogger.Printf("LEADER's term=%d is same as our term, we love our LEADER %s <3\n", request.Term, request.LeaderName)
 				responseData.NewTerm = currentTerm
-				responseData.Success = true
-
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
-				// LEADER is more up to date than us
+
+				// process Logs
+				c.processAE(request, &responseData)	
+
+			// LEADER is more up to date than us
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, updating our term\n", request.Term, currentTerm)
 				responseData.NewTerm = request.Term
@@ -555,16 +573,62 @@ func (c *ClientInfo) follower() {
 
 				currentTerm = c.setupFollower()
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
+
+				// process Logs
+				c.processAE(request, &responseData)
 			}
 
 			if conn != nil {
 				responseData.ClientName = c.ClientName
-				responseData.EntryLength = len(request.Entries)
 				c.SendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
 			} else {
 				// If failed, we don't have to send it over
 				panic("Connection is broken for AppendEntry RPC response")
 			}
+		}
+	}
+}
+
+// Update logs in followers, handle the AppendEntries RPC
+func (c *ClientInfo) processAE(request AppendEntryRequest, responseData *AppendEntryResponse) {
+	// Return failure if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm - need to move prevLogIndex back by 1
+	if request.PrevLogIndex == -1 || (request.PrevLogIndex < len(c.ReplicatedLog) && request.PrevLogTerm == c.ReplicatedLog[request.PrevLogIndex].Term) {
+		responseData.Success = true
+
+		// Find insertion point of passed log to replicate
+		insertIndex := request.PrevLogIndex + 1
+		newEntriesIndex := 0 // number of log entries to replicate
+
+		// Insertion index should be less than the length of replicated log, loop through entries that match the term, entries that may be kept
+		for insertIndex < len(c.ReplicatedLog) && newEntriesIndex < len(request.Entries) && c.ReplicatedLog[insertIndex].Term == request.Entries[newEntriesIndex].Term {
+			insertIndex++
+			newEntriesIndex++
+		}
+
+		// insertIndex points at end of the client's log, or an index where the client's log term mismatches with the from the LEADER, or the end index of where the newly added entries will be added
+		// newEntriesIndex points at the end of request.Entries, or an index where the term mistmatches with the corresponding log entry
+
+		// If existing entries conflict with new entries, "replace" all existing entries starting with first conflicting entry, leader's entries have priority
+		// Also, append any new entries not already in the log
+		if newEntriesIndex < len(request.Entries) {
+			c.ElecLogger.Printf("There are new entries from the LEADER to append to our log.\n")
+			c.ElecLogger.Printf("Entries past index %d are deleted, and indexes %d to %d LEADER's log entries are replicated to our log\n", insertIndex - 1, newEntriesIndex, len(request.Entries) - 1)
+			c.ReplicatedLog = append(c.ReplicatedLog[:insertIndex], request.Entries[newEntriesIndex:]...)
+			responseData.EntryLength = len(request.Entries)
+		} else {
+			responseData.EntryLength = 0 // don't update the next send's state machine if nothing was replicated
+		}
+
+		// Advance state machine with newly committed entries, if any
+		// Tentative: assumes the logs here will be matched as much as possible, as everything is replicated
+		if request.CommitIndex > c.CommitIndex {
+			c.CommitIndex = request.CommitIndex
+			if request.CommitIndex > len(c.ReplicatedLog) - 1 {
+				panic(fmt.Sprintf("The commit index for the request, %d, should not be higher then the length of the replicated log, %d\n", request.CommitIndex, len(c.ReplicatedLog) - 1))
+			}
+			c.ElecLogger.Printf("FOLLOWER's commitIndex=%d is outdated compared to LEADER=%s commitIndex=%d, committing\n", c.CommitIndex, request.LeaderName, request.CommitIndex)
+			
+			c.CommitReadyChan <- struct{}{}
 		}
 	}
 }
@@ -647,15 +711,16 @@ func (c *ClientInfo) candidate() {
 			if request.Term < tmpTerm {
 				c.ElecLogger.Printf("LEADER's term=%d is out of date (our term=%d), no action will be taken\n", request.Term, tmpTerm)
 				responseData.NewTerm = tmpTerm
-				// LEADER term matches our term, become FOLLOWER
+			// LEADER term matches our term, become FOLLOWER
 			} else if request.Term == tmpTerm {
 				c.ElecLogger.Printf("LEADER's term=%d is same as our term, stepping down\n", request.Term)
 				responseData.NewTerm = tmpTerm
-				responseData.Success = true
 
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
-				// LEADER is more up to date than us, become FOLLOWER
+
+				c.processAE(request, &responseData)
+			// LEADER is more up to date than us, become FOLLOWER
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, stepping down\n", request.Term, tmpTerm)
 				responseData.NewTerm = request.Term
@@ -667,11 +732,12 @@ func (c *ClientInfo) candidate() {
 
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
+
+				c.processAE(request, &responseData)
 			}
 
 			if conn != nil {
 				responseData.ClientName = c.ClientName
-				responseData.EntryLength = len(request.Entries)
 				c.SendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
 			} else {
 				// If failed, we don't have to send it over
@@ -733,7 +799,7 @@ func (c *ClientInfo) leader() {
 	c.Mu.Unlock()
 
 	// start heartbeat timer to send AppendEntry RPC
-	heartbeat := time.NewTicker((TIMEOUT / 3) * time.Second)
+	heartbeat := time.NewTicker(((TIMEOUT / 2) - 1) * time.Second)
 	defer heartbeat.Stop()
 
 	for c.getRole() == LEADER {
@@ -756,33 +822,35 @@ func (c *ClientInfo) leader() {
 				c.setRole(FOLLOWER)
 			} else if c.getRole() == LEADER && tmpTerm == reply.NewTerm {
 				nextIndex, _ := c.NextIndex.Get(reply.ClientName)
+				// reply.Success indicates if follower contained entry matching prevLogIndex and prevLogTerm, that is, FOLLOWER's log is now up-to-date
 				if reply.Success {
-					c.NextIndex.Set(reply.ClientName, nextIndex + reply.EntryLength)
+					c.NextIndex.Set(reply.ClientName, nextIndex + reply.EntryLength) // we are mistakenly sending out the log...
 					c.MatchIndex.Set(reply.ClientName, nextIndex + reply.EntryLength - 1)
 					
 					c.ElecLogger.Printf("AppendEntry RPC from %s is successful: nextIndex=%d, matchIndex=%d\n", reply.ClientName, nextIndex + reply.EntryLength, nextIndex + reply.EntryLength - 1)
 					
-					// see if entries are ready to be committed
+					// See if entries are ready to be committed
 					savedCommitIndex := c.CommitIndex
 					for i := c.CommitIndex + 1; i < len(c.ReplicatedLog); i++ {
-						// only commit terms in the current index safely (exercise caution when committing terms in previous indexes)
+						// Entries are committed if stored on a majority of servers and at least one entry from current term is stored on majority of servers
 						if c.ReplicatedLog[i].Term == c.CurrentTerm {
 							matchCount := 1
 							
-							// commit logs that were replicated to a majority of followers
+							// Commit logs that were replicated to a majority of followers on the next RPC
 							for _, clientName := range c.OutboundConns.Keys(false) {
 								if lastMatchedLogIndex, _ := c.MatchIndex.Get(clientName); lastMatchedLogIndex >= i {
 									matchCount++	
 								}
 							}
-
+							
+							// We assume the previous terms are also to be committed if the latest term is ready...
 							if matchCount >= MAJORITY {
 								c.CommitIndex = i
 							}
 						}
 					}
 
-					// New thngs should be committed based on response from log, signal commit channel, as commits may take time
+					// Commit log entries that should be committed on our own state machine, signal commit channel, as commits may take time
 					if savedCommitIndex != c.CommitIndex {
 						c.ElecLogger.Printf("LEADER is committing log entries from indexes %d to %d\n", savedCommitIndex + 1, c.CommitIndex)
 						c.CommitReadyChan <- struct{}{} // signal new commits are ready
@@ -791,7 +859,7 @@ func (c *ClientInfo) leader() {
 					 // again, nextIndex represents the "unique value" that hasn't been overwritten by the log
 					c.NextIndex.Set(reply.ClientName, nextIndex - 1) // decrease it by one, see if we can apply our log by one more entry the next time
 
-					c.ElecLogger.Printf("AppendEntry RPC didn't update the logs properly, decrease by 1, retrying\n")
+					c.ElecLogger.Printf("AppendEntry RPC didn't update the logs properly on client %s, decrease by 1, retrying\n", reply.ClientName)
 				}
 			}
 		case request := <-c.ReqVoteRequestChan:
@@ -840,15 +908,16 @@ func (c *ClientInfo) leader() {
 			if request.Term < tmpTerm {
 				c.ElecLogger.Printf("Other LEADER's term=%d is out of date (our term=%d), tell LEADER to step down\n", request.Term, tmpTerm)
 				responseData.NewTerm = tmpTerm
-				// LEADER term matches our term, become FOLLOWER
+			// LEADER term matches our term, become FOLLOWER
 			} else if request.Term == tmpTerm {
 				c.ElecLogger.Printf("LEADER's term=%d is same as our term, stepping down\n", request.Term)
 				responseData.NewTerm = tmpTerm
-				responseData.Success = true
 
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
-				// LEADER is more up to date than us, become FOLLOWER
+
+				c.processAE(request, &responseData)
+			// LEADER is more up to date than us, become FOLLOWER
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, stepping down\n", request.Term, tmpTerm)
 				responseData.NewTerm = request.Term
@@ -860,11 +929,12 @@ func (c *ClientInfo) leader() {
 
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
+
+				c.processAE(request, &responseData) // we have to append entries to the log, if entries are sent
 			}
 
 			if conn != nil {
 				responseData.ClientName = c.ClientName
-				responseData.EntryLength = len(request.Entries)
 				c.SendRPC(APPENDENTRIES_REPLY, &responseData, conn, fmt.Sprintf("AppendEntry RPC response with data: %+v", responseData), request.LeaderName)
 			} else {
 				// If failed, we don't have to send it over
@@ -913,8 +983,6 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 
 		if exists {
 			go func(connection net.Conn, clientName string) {
-				c.ElecLogger.Printf("Sending AppendEntry RPC to client: %s\n", clientName)
-
 				c.Mu.Lock()
 				nextIndex, _ := c.NextIndex.Get(clientName) // next index should be the latest "unique" entry on the destination's log
 				lastMatchingIndex := nextIndex - 1 // the last index on the destination where we are sure its log entry matches ours
@@ -924,7 +992,8 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 					prevLogTerm = c.ReplicatedLog[lastMatchingIndex].Term
 				}
 
-				entries := c.ReplicatedLog[nextIndex:] // new entries to send, should replace whatever is on the FOLLOWER's log past this point
+				entries := c.ReplicatedLog[nextIndex:] // new entries to send, may replace whatever is on the FOLLOWER's log past prevLogIndex
+				c.ElecLogger.Printf("Sending AppendEntry RPC to client: %s, PrevLogIndex=%d, length of entries=%d\n", clientName, lastMatchingIndex, len(entries))
 
 				requestData := AppendEntryRequest{
 					Term:         term,
@@ -932,7 +1001,7 @@ func (c *ClientInfo) sendHeartBeat(term int) {
 					PrevLogIndex: lastMatchingIndex,
 					PrevLogTerm:  prevLogTerm,
 					Entries:      entries, // Entries being empty means heartbeat only
-					CommitIndex:  c.CommitIndex,
+					CommitIndex:  c.CommitIndex, // Specifies the index of the last committed entry on the leader
 				}
 				c.Mu.Unlock()
 
@@ -1080,7 +1149,7 @@ func (c *ClientInfo) Submit(command RawCommand) bool {
 
 		// Assume that the edge case where command has already been committed but response isn't received doesn't happen
 		if present {
-			c.CommandLogger.Printf("Command has already been added to the log but has not yet been committed, ignore command\n")
+			c.CommandLogger.Printf("Command has already been added to the log, ignore command\n")
 		} else {
 			c.ReplicatedLog = append(c.ReplicatedLog, logEntry)
 			c.CommandLogger.Printf("LogEntry [%+v] saved locally for term=%d\n", logEntry, c.CurrentTerm)

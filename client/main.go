@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 	"log"
-	// "time"
+	"time"
 
 	// "errors"
 	// "io"
@@ -32,6 +32,7 @@ var port string
 var processId int64
 var clientInfoMu sync.Mutex
 var leaderInfoMutex sync.Mutex
+var commitChan chan struct{}
 
 func main() {
 	processId = int64(os.Getpid())
@@ -55,7 +56,8 @@ func main() {
 
 // init server with default configuration and connect to other servers
 func serverInit() {
-	myInfo.NewRaft(processId, os.Args[1], &clientInfoMu, &leaderInfoMutex)
+	commitChan = make(chan struct{})
+	myInfo.NewRaft(processId, os.Args[1], &clientInfoMu, &leaderInfoMutex, commitChan)
 
 	if myInfo.ClientName == "A" {
 		port = A
@@ -183,6 +185,7 @@ func takeUserInput() {
 	fmt.Println("===== Actions =====\np - print client info\n===================")
 	for {
 		_, err := fmt.Scanln(&action)
+		timer := time.After(15 * time.Second)
 
 		if err != nil {
 			fmt.Println("Error occurred when scanning input")
@@ -197,7 +200,7 @@ func takeUserInput() {
 			}
 			if myInfo.CheckSelf() {
 				// We are LEADER, just submit to our log
-				go myInfo.Submit(command)
+				go myInfo.Submit(command) // TODO: make a goroutine that resend commands upon a timeout until we wait for something
 			} else {
 				// Send RPC to LEADER, keep sending if response not received within 20 seconds
 				myInfo.CurrentLeader.Mu.Lock()
@@ -213,8 +216,23 @@ func takeUserInput() {
 			}
 
 			commandIndex++
+		} else if action == "get" {
+			fmt.Println("Invalid action:", action)
+		} else if action == "put" {
+
 		} else {
 			fmt.Println("Invalid action:", action)
+		}
+
+		// wait for the command to be committed
+		for commit := false; !commit; {
+			select {
+			case <- commitChan:
+				commit = true
+			case <- timer:
+				// timeout, send request again
+				timer = time.After(15 * time.Second)
+			}
 		}
 	}
 }
