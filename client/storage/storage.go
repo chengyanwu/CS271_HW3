@@ -3,6 +3,8 @@ package storage
 import (
 	"sync"
 	"net"
+	"example/users/client/dictionary"
+	"crypto/rsa"
 )
 
 // Stores the last updated index on all other clients known by the LEADER client
@@ -11,9 +13,123 @@ type StringIntMap struct {
 	m map[string]int
 }
 
+type DictofDicts struct {
+	mu sync.Mutex
+	m map[string]*dictionary.Dictionary
+}
+
 type ConnStorage struct {
 	mu sync.Mutex
 	m  map[string]net.Conn
+}
+
+func NewDictofDicts() DictofDicts {
+	m := make(map[string]*dictionary.Dictionary)
+	return DictofDicts{
+		m: m,
+	}
+}
+
+// Creates a new dictionary in the state machine
+func (d *DictofDicts) NewDict(dictionary_id string, clientIDs []string, privKey *rsa.PrivateKey) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, exists := d.m[dictionary_id]; !exists {
+		newDict := dictionary.NewDict(dictionary_id, clientIDs, privKey)
+		d.m[dictionary_id] = &newDict
+
+		return true // new dictionary is created
+	}
+
+	return false // SHOULD NEVER happen: dictionary_id already exists
+}
+
+func (d *DictofDicts) Put(dictionary_id, key, value string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, exists := d.m[dictionary_id]; exists {
+		d.m[dictionary_id].Put(key, value)
+		
+		return true
+	}
+
+	return false // SHOULD NEVER happen: dictionary_id doesn't exist
+}
+
+func (d *DictofDicts) Exists(dictionary_id string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, exists := d.m[dictionary_id]
+
+	return exists
+}
+
+func (d *DictofDicts) Get(dictionary_id, key string) (string, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, exists := d.m[dictionary_id]; exists {
+		ans, succ := d.m[dictionary_id].Get(key)
+
+		return ans, succ
+	}
+
+	return "", false // fails if key isn't present in the dictionary or if dictionary_id doesn't exists
+}
+
+func (d *DictofDicts) GetPubKey(dictionary_id string) (*rsa.PublicKey, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, exists := d.m[dictionary_id]; exists {
+		ans := d.m[dictionary_id].PublicKey
+
+		return ans, true
+	}
+
+	return nil, false
+}
+
+func (d *DictofDicts) GetClientIds(dictionary_id string) ([]string, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, exists := d.m[dictionary_id]; exists {
+		ans := d.m[dictionary_id].ClientIds
+
+		return ans, true
+	}
+
+	return nil, false
+}
+
+func (d *DictofDicts) PrintDict(dictionary_id string) (string, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, exists := d.m[dictionary_id]; exists {
+		ans := d.m[dictionary_id].String()
+
+		return ans, true
+	}
+
+	return "", false
+}
+
+func (d *DictofDicts) GetMemberDictionaries(clientName string) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	
+	var ids []string
+	for _, dict := range d.m {
+		if dict.ClientIsMember(clientName) {
+			ids = append(ids, dict.DictId)
+		}
+	}
+
+	return ids
 }
 
 func NewConnStorage() ConnStorage {

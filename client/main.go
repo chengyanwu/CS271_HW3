@@ -57,6 +57,8 @@ func main() {
 // init server with default configuration and connect to other servers
 func serverInit() {
 	commitChan = make(chan struct{})
+
+	// Creates a new RAFT and perform recovery
 	myInfo.NewRaft(processId, os.Args[1], &clientInfoMu, &leaderInfoMutex, commitChan)
 
 	if myInfo.ClientName == "A" {
@@ -180,59 +182,178 @@ func establishConnection(clientPort string) net.Conn {
 }
 
 func takeUserInput() {
-	var action string
+	// var action string
 	commandIndex := 0
+	reader := bufio.NewReader(os.Stdin)
 	fmt.Println("===== Actions =====\np - print client info\n===================")
 	for {
-		_, err := fmt.Scanln(&action)
-		timer := time.After(15 * time.Second)
-
+		var command client.RawCommand
+		action, err := reader.ReadString('\n')
+		action = action[:len(action) - 1] // removes delimiter byte
+		split := strings.Split(action, " ")
+		
 		if err != nil {
 			fmt.Println("Error occurred when scanning input")
-		} else if action == "p" {
+			continue
+		} else if split[0] == "p" {
 			fmt.Println(&myInfo)
-		// for now, use placeholder command
-		} else if action == "create" {
-			command := client.RawCommand{
-				Action: client.CREATE,
-				SenderName: myInfo.ClientName,
-				CommandId: fmt.Sprintf("%s:%d", myInfo.ClientName, commandIndex),
-			}
-			if myInfo.CheckSelf() {
-				// We are LEADER, just submit to our log
-				go myInfo.Submit(command) // TODO: make a goroutine that resend commands upon a timeout until we wait for something
-			} else {
-				// Send RPC to LEADER, keep sending if response not received within 20 seconds
-				myInfo.CurrentLeader.Mu.Lock()
-				conn := myInfo.CurrentLeader.OutboundConnection
-				name := myInfo.CurrentLeader.ClientName
-				myInfo.CurrentLeader.Mu.Unlock()
+			continue
+		} else if split[0] == "create" {
+			// parse client IDs
+			clientIDs := split[1:]
 
-				if conn != nil {
-					go myInfo.SendRPC(client.COMMAND, &command, conn, "Command send failed, no LEADER yet or LEADER has crashed, will retry\n", name)
-				} else {
-					fmt.Println("Leader not established. TODO: retry")
+			if len(clientIDs) < 1 {
+				fmt.Println("USAGE: create <client-id> <client_id>...")
+				continue
+			}
+
+			invalid := false 
+			for _, id := range clientIDs {
+				if !(id == "A" || id == "B" || id == "C" || id == "D" || id == "E") {
+					fmt.Println("Invalid ID:", id)
+					invalid = true
 				}
 			}
 
-			commandIndex++
-		} else if action == "get" {
-			fmt.Println("Invalid action:", action)
-		} else if action == "put" {
+			if invalid {
+				continue
+			}
 
+			command = client.RawCommand{
+				Action: client.CREATE,
+				SenderName: myInfo.ClientName,
+				CommandId: fmt.Sprintf("%s:%d", myInfo.ClientName, commandIndex),
+				ClientIds: clientIDs,
+			}
+
+			commandIndex++
+		} else if split[0] == "get" {
+			if len(split) < 3 {
+				fmt.Println("USAGE: get <dictionary_id> <key>")
+				continue
+			}
+
+			dictionaryId := split[1]
+			key := split[2]
+
+			// check if dictionary with dictionaryId exists
+			if !myInfo.StateMachine.Exists(dictionaryId) {
+				fmt.Printf("DictionaryId %s doesn't exist\n", dictionaryId)
+				continue
+			}
+
+			command = client.RawCommand{
+				Action: client.GET,
+				SenderName: myInfo.ClientName,
+				CommandId: fmt.Sprintf("%s:%d", myInfo.ClientName, commandIndex),
+				DictionaryId: dictionaryId,
+				Key: key,
+			}
+			commandIndex++
+		} else if split[0] == "put" {
+			if len(split) < 4 {
+				fmt.Println("USAGE: put <dictionary_id> <key> <value>")
+				continue
+			}
+
+			dictionaryId := split[1]
+			key := split[2]
+			value := split[3]
+			
+			// check if dictionary with dictionaryId exists
+			if !myInfo.StateMachine.Exists(dictionaryId) {
+				fmt.Printf("DictionaryId %s doesn't exist\n", dictionaryId)
+				continue
+			}
+			
+			command = client.RawCommand{
+				Action: client.PUT,
+				SenderName: myInfo.ClientName,
+				CommandId: fmt.Sprintf("%s:%d", myInfo.ClientName, commandIndex),
+				DictionaryId: dictionaryId,
+				Key: key,
+				Value: value,
+			}
+			commandIndex++
+		} else if split[0] == "printDict" {
+			if len(split) < 2 {
+				fmt.Println("USAGE: printDict <dictionary_id>")
+				continue
+			}
+
+			dictionaryId := split[1]
+			clientIds, exists := myInfo.StateMachine.GetClientIds(dictionaryId)
+
+			if exists {
+				dictContent, _ := myInfo.StateMachine.PrintDict(dictionaryId)
+
+				fmt.Println("===================================")
+				fmt.Printf("Client IDs: %+v\n", clientIds)
+				fmt.Printf("Dict Content:\n %+v", dictContent)
+				fmt.Println("===================================")
+			} else {
+				fmt.Println("=====================================")
+				fmt.Println("No dictionary found with the given ID")
+				fmt.Println("=====================================")
+			}
+			continue
+		} else if split[0] == "printAll" {
+			fmt.Println("====================================")
+			memberDicts := myInfo.StateMachine.GetMemberDictionaries(myInfo.ClientName) 
+			if len(memberDicts) == 0 {
+				fmt.Println("Members: ", memberDicts)
+			} else {
+				fmt.Println("There are no dictionaries that we are a member of")
+			}
+			fmt.Println("====================================")	
+			continue
+		} else if split[0] == "failLink" {
+			fmt.Println("TODO")
+			continue
+		} else if split[0] == "fixLink" {
+			fmt.Println("TODO")	
+			continue
+		} else if split[0] == "failProcess" {
+			fmt.Println("TODO")
+			continue
 		} else {
 			fmt.Println("Invalid action:", action)
+			continue
 		}
 
-		// wait for the command to be committed
+		sendCommand(command)
+		timer := time.After(15 * time.Second)
+
+		// Wait for the command to be committed, or timeout
 		for commit := false; !commit; {
+			// fmt.Println("In loop")
 			select {
 			case <- commitChan:
 				commit = true
 			case <- timer:
 				// timeout, send request again
+				sendCommand(command)
 				timer = time.After(15 * time.Second)
 			}
+		}
+		fmt.Println("Past loop")
+	}
+}
+
+func sendCommand(command client.RawCommand) {
+	if myInfo.CheckSelf() {
+		// We are LEADER, just submit to our log
+		go myInfo.Submit(command) 
+	} else {
+		myInfo.CurrentLeader.Mu.Lock()
+		conn := myInfo.CurrentLeader.OutboundConnection
+		name := myInfo.CurrentLeader.ClientName
+		myInfo.CurrentLeader.Mu.Unlock()
+
+		if conn != nil {
+			go myInfo.SendRPC(client.COMMAND, &command, conn, "Command send failed, no LEADER yet or LEADER has crashed, will retry\n", name)
+		} else {
+			fmt.Println("Leader not established, retrying after 15 seconds.")
 		}
 	}
 }
@@ -247,7 +368,6 @@ func handleError(err error, message string, connection net.Conn) {
 }
 
 func writeToConnection(connection net.Conn, message string) {
-	// time.Sleep(1 * time.Second)
 	_, err := connection.Write([]byte(message))
 
 	handleError(err, "Error writing.", connection)

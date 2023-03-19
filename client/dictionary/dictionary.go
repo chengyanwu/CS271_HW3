@@ -1,23 +1,25 @@
 package dictionary
 
 import (
-	"strconv"
+	"crypto/rsa"
+	"fmt"
 )
 
-// dictionary object struct
+// Dictionary object struct, part of the state machine storage
 type Dictionary struct {
-	Dict_ID   string
-	ClientIDs []string
-	PublicKey string
-	Dict      map[string]string
+	DictId     string
+	ClientIds  []string
+	PrivateKey *rsa.PrivateKey   // nil if client doesn't have access to the dictionary
+	PublicKey  *rsa.PublicKey
+	Dict       map[string]string
 }
 
-func (d *Dictionary) NewDict(id string, cnt int, clientIDs []string, publicKey string, dict map[string]string) Dictionary {
-	return Dictionary{
-		Dict_ID:   id + strconv.Itoa(cnt),
-		ClientIDs: clientIDs,
-		PublicKey: publicKey,
-		Dict:      dict,
+func NewDict(id string, clientIDs []string, privKey *rsa.PrivateKey) Dictionary {
+	return Dictionary {
+		DictId:    id,
+		ClientIds: clientIDs,
+		PrivateKey: privKey,
+		Dict:      make(map[string]string),
 	}
 }
 
@@ -25,6 +27,28 @@ func (d *Dictionary) Put(key string, value string) {
 	d.Dict[key] = value
 }
 
-func (d *Dictionary) Get(key string) string {
-	return d.Dict[key]
+func (d *Dictionary) Get(key string) (string, bool) {
+	value, exists := d.Dict[key]
+
+	return value, exists
+}
+
+func (d *Dictionary) String() string {
+	var ans string
+	for _, key := range d.Dict {
+		ans += fmt.Sprintf("Key: %s", key)
+		ans += fmt.Sprintf("   Value: %s\n", d.Dict[key])
+	}
+
+	return ans
+}
+
+func (d *Dictionary) ClientIsMember(clientName string) bool {
+	for _, value := range d.ClientIds {
+		if clientName == value {
+			return true
+		}
+	}
+
+	return false
 }

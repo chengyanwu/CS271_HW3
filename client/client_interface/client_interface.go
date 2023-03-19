@@ -14,7 +14,6 @@ import (
 	"time"
 
 	crypto "example/users/client/crypto"
-	dictionary "example/users/client/dictionary"
 	disk "example/users/client/disk"
 	storage "example/users/client/storage"
 )
@@ -89,28 +88,25 @@ type ClientInfo struct {
 	ClientName    string               // name identifier: A, B, C, D, E
 	OutboundConns storage.ConnStorage  // outbound connections to other servers
 	InboundConns  storage.ConnStorage  // inbound connections from other servers
-	CurrentTerm   int                  // current leader term
+	
 	NextIndex     storage.StringIntMap // stores index of log entry on destination immediately preceding the new ones we are sending
 	MatchIndex    storage.StringIntMap // 
 
 	CommitIndex   int                  // Furthest known index of commit
 	LastApplied   int                  // Index of the last applied commit on the current server, used when commits are processed
 
-	ReplicatedLog []LogEntry           // log entries, read from the disk
-	VotedFor      string               // name of client voted for leader
 	CurrentRole   Role                 // 1: follower / 2: leader / 3: candidate
 	CurrentLeader LeaderInfo           // information of the current leader
 	VotesReceived []string             // names of channels whose vote were received
 	Mu            *sync.Mutex
-	LogStore      disk.LogStore        // interact to store logs and other info on disk
+	DiskStore      disk.DiskStore      // interact to store logs and other info on disk
 
-	// TODO: StateMachine storage.ReplicatedDictOfDicts
-	Faillinks     map[string]net.Conn // Stop sending messages to and ignores messages received from the connections here
-	Keys          crypto.Keys         // public and private keys
-	DiskLogger    *log.Logger         // logs information about AppendEntry RPCs and commits to the state machine
-	ElecLogger    *log.Logger         // logs information about Election RPCs and leader changes
-	ConnLogger    *log.Logger         // logs information about outgoing and ingoing messages on connections, and connection disconnects
-	CommandLogger *log.Logger         // logs information about handling commands from the client
+	Faillinks     map[string]net.Conn  // Stop sending messages to and ignores messages received from the connections here
+	
+	DiskLogger    *log.Logger          // logs information about AppendEntry RPCs and commits to the state machine
+	ElecLogger    *log.Logger          // logs information about Election RPCs and leader changes
+	ConnLogger    *log.Logger          // logs information about outgoing and ingoing messages on connections, and connection disconnects
+	CommandLogger *log.Logger          // logs information about handling commands from the client
 
 	// Communication channels for RPC
 	ReqVoteRequestChan      chan RequestVoteRequest
@@ -121,13 +117,20 @@ type ClientInfo struct {
 	CommitChan				chan<- struct{} // Channel that signals commits have finished to the client making the req
 	CommitReadyChan         chan struct{}   // Channel that signals commits are ready to be made on LEADER
 
-
 	// Random number generator
 	r           *rand.Rand
 
-	// List of dictionary
-	DictCounter int
-	DictList    []dictionary.Dictionary
+	// ============ STATE MACHINE ===========
+	StateMachine            storage.DictofDicts // dict of dicts
+	NumDict                 int
+	// ======================================
+
+	// ============ NON-VOLATILE ============
+	Keys          crypto.Keys         // public and private keys
+	ReplicatedLog []LogEntry          // log entries, read from the disk
+	CurrentTerm   int                 // current term
+	VotedFor      string              // name of client voted for leader
+	// ======================================
 }
 
 // PROTOCOL: [identifier:marshalled byte slice]
@@ -147,27 +150,25 @@ type LogEntry struct {
 	LogCreateCommand LogCreateCommand
 	// =====================================================================================
 	CommandId        string
+	SenderName       string
 }
 
 // === THESE STRUCTS ARE FOR LOG ONLY AND WON'T BE SENT OVER THE NETWORK ===
 type LogGetCommand struct {
 	DictionaryId string
-	ClientId     string // id of client who issued the command
 	EncryptedKey []byte // encrypted with the dictionary's public key
 }
 
 type LogPutCommand struct {
 	DictionaryId      string
-	ClientId          string // id of client who issued the command
 	EncryptedKeyValue []byte // encrypted with the dictionary's public key
-
 }
 
 type LogCreateCommand struct {
 	DictionaryId          string
 	MemberClientId        []string // A, B, C, etc.
-	DictionaryPublicKey   []byte   // dictionary's unencrypted public key
 	DictionaryPrivateKeys [][]byte // encrypted dictionary's private keys using MemberClientId's public keys (can only be decrypted using the right private key for each member)
+	DictionaryPublicKey   []byte
 }
 
 // ==========================================================================
@@ -313,20 +314,6 @@ func (c *RawCommand) Demarshal(b []byte) {
 	json.Unmarshal(b, c)
 }
 
-// func (r *CommandResponse) Marshal() []byte {
-// 	bytes, err := json.Marshal(r)
-
-// 	if err != nil {
-// 		panic(fmt.Sprintf("Failed to marshal Command response struct: %+v\n", *r))
-// 	}
-
-// 	return bytes
-// }
-
-// func (r *CommandResponse) Demarshal(b []byte) {
-// 	json.Unmarshal(b, r)
-// }
-
 // Check if current client is the leader
 func (c *ClientInfo) CheckSelf() bool {
 	c.CurrentLeader.Mu.Lock()
@@ -376,6 +363,7 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.NextIndex = storage.NewStringIntMap()
 	c.MatchIndex = storage.NewStringIntMap()
 	c.CurrentTerm = 0
+	c.NumDict = 0
 
 	c.LastApplied = -1 // LastApplied entry, used in the channel handler
 	c.CommitIndex = -1
@@ -386,7 +374,7 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.CurrentLeader = LeaderInfo{false, leaderInfoMu, "", nil, nil}
 	c.VotesReceived = make([]string, 0)
 	c.Mu = clientMu
-	c.LogStore = disk.LogStore{} // TODO
+	// c.DiskStore = disk.DiskStore{} // TODO
 	c.Faillinks = make(map[string]net.Conn)
 	c.DiskLogger = log.New(os.Stdout, "[FSM]", log.LstdFlags)
 	c.ElecLogger = log.New(os.Stdout, "[ELEC/AE]", log.LstdFlags)
@@ -404,20 +392,13 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	generator := rand.NewSource(processID)
 	c.r = rand.New(generator)
 
-	// set up public and private key
-	c.Keys = crypto.NewKeys()
-	c.Keys.Print()
-
 	// set up dictionary list
-	c.DictCounter = 0
-	c.DictList = make([]dictionary.Dictionary, 0)
+	c.StateMachine = storage.NewDictofDicts()
+
+	// recover from crash and restore persistent state
+	c.DiskStore = c.Init()
 
 	go c.handleCommits()
-}
-
-// Recover client information after crashing
-func (c *ClientInfo) Recover() {
-	// TODO
 }
 
 // Begin listening on the passed connection
@@ -429,9 +410,9 @@ func (c *ClientInfo) Listen(connection net.Conn, clientName string) {
 // Main RAFT algorithm
 func (c *ClientInfo) RAFT() {
 	c.ElecLogger.Println("RAFT starting, waiting for elections")
-	c.init()
+	
 	for {
-		// switch statement for leader, candidiate, and follower
+		// Switch statement for leader, candidiate, and follower
 		switch c.getRole() {
 		case FOLLOWER:
 			c.follower()
@@ -461,7 +442,6 @@ func (c *ClientInfo) handleCommits() {
 
 		for _, entry := range commitEntry {
 			c.businessLogicApply(entry)
-			// c.CommitChan <- struct{}{}
 		}
 	}
 }
@@ -469,16 +449,14 @@ func (c *ClientInfo) handleCommits() {
 // Perform operations on committed log entries, returns a string to be printed
 func (c *ClientInfo) businessLogicApply(logEntry LogEntry) {
 	c.ElecLogger.Printf("Running business logic for commit with CommandId=%s\n", logEntry.CommandId)
-	// TODO: Ian - run business logic and generate message to print
-	msg := "temp"
-	clientID := strings.Split(logEntry.CommandId, DELIM)[0]
+	// TODO: Modify state machine and generate message to print
+	msg := "swagleon"
 
-	if clientID == c.ClientName {
-		fmt.Print(msg)
+	if logEntry.SenderName == c.ClientName {
+		fmt.Printf("======\n%s\n======\n", msg)
 		c.CommitChan <- struct{}{}
 	}
 	// If self isn't the client that made the request, don't print the output
-	// c.CommitChan <- struct{}{}	
 }
 
 // Prologue to run before becoming a follower
@@ -509,13 +487,15 @@ func (c *ClientInfo) follower() {
 
 		// Resets timer only if vote is successfully granted to CANDIDATE
 		case request := <-c.ReqVoteRequestChan:
-			c.ElecLogger.Printf("RequestVote request received from CANDIDIATE %s for term=%d, our term=%d\n", request.CandidateName, request.CandidateTerm, currentTerm)
 
 			var responseData RequestVoteResponse
 			conn, _ := c.OutboundConns.Get(request.CandidateName)
 
+			lastLogIndex, lastLogTerm := c.getLastIndexAndTerm()
+			c.ElecLogger.Printf("RequestVote request received from CANDIDIATE %s for term=%d, our term=%d\n", request.CandidateName, request.CandidateTerm, currentTerm)
+
 			if request.CandidateTerm > currentTerm {
-				// update current term
+				// Update current term
 				c.Mu.Lock()
 				c.CurrentTerm = request.CandidateTerm
 				c.Mu.Unlock()
@@ -523,7 +503,10 @@ func (c *ClientInfo) follower() {
 				currentTerm = c.setupFollower()
 			}
 
-			if request.CandidateTerm == currentTerm && (c.VotedFor == "" || c.VotedFor == request.CandidateName) {
+			if request.CandidateTerm == currentTerm &&
+				(c.VotedFor == "" || c.VotedFor == request.CandidateName) &&
+				(request.LastLogTerm > lastLogTerm || 
+					(request.LastLogTerm == lastLogTerm && request.LastLogIndex >= lastLogIndex)) {
 				c.VotedFor = request.CandidateName
 				responseData.VoteGranted = true
 
@@ -555,16 +538,15 @@ func (c *ClientInfo) follower() {
 			if request.Term < currentTerm {
 				c.ElecLogger.Printf("LEADER's term=%d is out of date (our term=%d), no action will be taken\n", request.Term, currentTerm)
 				responseData.NewTerm = currentTerm
-				// LEADER term matches our term
+			// LEADER term matches our term
 			} else if request.Term == currentTerm {
-				// TODO: after we finish leader election
+				// After we finish leader election
 				c.ElecLogger.Printf("LEADER's term=%d is same as our term, we love our LEADER %s <3\n", request.Term, request.LeaderName)
 				responseData.NewTerm = currentTerm
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 
 				// process Logs
 				c.processAE(request, &responseData)	
-
 			// LEADER is more up to date than us
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, updating our term\n", request.Term, currentTerm)
@@ -592,7 +574,7 @@ func (c *ClientInfo) follower() {
 	}
 }
 
-// Update logs in followers, handle the AppendEntries RPC
+// Update our log, handle the AppendEntries RPC
 func (c *ClientInfo) processAE(request AppendEntryRequest, responseData *AppendEntryResponse) {
 	// Return failure if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm - need to move prevLogIndex back by 1
 	if request.PrevLogIndex == -1 || (request.PrevLogIndex < len(c.ReplicatedLog) && request.PrevLogTerm == c.ReplicatedLog[request.PrevLogIndex].Term) {
@@ -615,11 +597,11 @@ func (c *ClientInfo) processAE(request AppendEntryRequest, responseData *AppendE
 		// Also, append any new entries not already in the log
 		if newEntriesIndex < len(request.Entries) {
 			c.ElecLogger.Printf("There are new entries from the LEADER to append to our log.\n")
-			c.ElecLogger.Printf("Entries past index %d are deleted, and indexes %d to %d LEADER's log entries are replicated to our log\n", insertIndex - 1, newEntriesIndex, len(request.Entries) - 1)
+			c.ElecLogger.Printf("Entries past index %d are deleted, and indexes %d to %d on the updated entries are replicated to our log\n", insertIndex - 1, newEntriesIndex, len(request.Entries) - 1)
 			c.ReplicatedLog = append(c.ReplicatedLog[:insertIndex], request.Entries[newEntriesIndex:]...)
 			responseData.EntryLength = len(request.Entries)
 		} else {
-			responseData.EntryLength = 0 // don't update the next send's state machine if nothing was replicated
+			responseData.EntryLength = 0 // Don't update the next send's state machine if nothing was replicated
 		}
 
 		// Advance state machine with newly committed entries, if any
@@ -673,8 +655,10 @@ func (c *ClientInfo) candidate() {
 			var responseData RequestVoteResponse
 			conn, _ := c.OutboundConns.Get(request.CandidateName)
 
+			lastLogIndex, lastLogTerm := c.getLastIndexAndTerm()
+			
 			if request.CandidateTerm > tmpTerm {
-				// update current term, clear our own vote
+				// Update current term, become follower, then vote
 				c.Mu.Lock()
 				c.CurrentTerm = request.CandidateTerm
 				c.Mu.Unlock()
@@ -683,7 +667,10 @@ func (c *ClientInfo) candidate() {
 				c.setRole(FOLLOWER)
 			}
 
-			if request.CandidateTerm == tmpTerm && (c.VotedFor == "" || c.VotedFor == request.CandidateName) {
+			if request.CandidateTerm == tmpTerm &&
+				(c.VotedFor == "" || c.VotedFor == request.CandidateName) &&
+				(request.LastLogTerm > lastLogTerm || 
+					(request.LastLogTerm == lastLogTerm && request.LastLogIndex >= lastLogIndex)){
 				c.VotedFor = request.CandidateName
 				responseData.VoteGranted = true
 
@@ -801,7 +788,7 @@ func (c *ClientInfo) leader() {
 	c.Mu.Unlock()
 
 	// start heartbeat timer to send AppendEntry RPC
-	heartbeat := time.NewTicker(((TIMEOUT / 2) - 1) * time.Second)
+	heartbeat := time.NewTicker(((TIMEOUT / 2) + 1) * time.Second)
 	defer heartbeat.Stop()
 
 	for c.getRole() == LEADER {
@@ -826,7 +813,7 @@ func (c *ClientInfo) leader() {
 				nextIndex, _ := c.NextIndex.Get(reply.ClientName)
 				// reply.Success indicates if follower contained entry matching prevLogIndex and prevLogTerm, that is, FOLLOWER's log is now up-to-date
 				if reply.Success {
-					c.NextIndex.Set(reply.ClientName, nextIndex + reply.EntryLength) // we are mistakenly sending out the log...
+					c.NextIndex.Set(reply.ClientName, nextIndex + reply.EntryLength)
 					c.MatchIndex.Set(reply.ClientName, nextIndex + reply.EntryLength - 1)
 					
 					c.ElecLogger.Printf("AppendEntry RPC from %s is successful: nextIndex=%d, matchIndex=%d\n", reply.ClientName, nextIndex + reply.EntryLength, nextIndex + reply.EntryLength - 1)
@@ -871,7 +858,7 @@ func (c *ClientInfo) leader() {
 			conn, _ := c.OutboundConns.Get(request.CandidateName)
 
 			if request.CandidateTerm > tmpTerm {
-				// update current term, become FOLLOWER
+				// Update current term, become FOLLOWER
 				c.Mu.Lock()
 				c.CurrentTerm = request.CandidateTerm
 				c.Mu.Unlock()
@@ -931,7 +918,7 @@ func (c *ClientInfo) leader() {
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
 
-				c.processAE(request, &responseData) // we have to append entries to the log, if entries are sent
+				c.processAE(request, &responseData) // We have to append entries to the log, if entries are sent
 			}
 
 			if conn != nil {
@@ -941,6 +928,8 @@ func (c *ClientInfo) leader() {
 				// If failed, we don't have to send it over
 				panic("Connection is broken for AppendEntry RPC response")
 			}
+		case <- c.ReqVoteResponseChan:
+			continue
 		}
 	}
 }
@@ -1026,16 +1015,40 @@ func (c *ClientInfo) setRole(newRole Role) {
 	c.Mu.Unlock()
 }
 
-// TODO: Do all the setup work before starting RAFT (public/private keys)
-func (c *ClientInfo) init() {
+// Do all the setup work before starting RAFT (public/private keys)
+// Return file descriptors to the RAFT log and variable files
+func (c *ClientInfo) Init() disk.DiskStore {
+	existingStore := disk.Exists(c.ClientName)
+	newStore := disk.DiskInit(c.ClientName)
 
+	// Generate keys, and save to disk, test after this has finished
+	if !existingStore {
+		c.DiskLogger.Printf("Existing state not detected on disk, generating new keys\n")
+		c.Keys = crypto.NewKeys()
+
+		newStore.WritePersonalKeysToDisk(c.Keys)
+	} else {
+		c.DiskLogger.Printf("Existing state detected on disk, recovering log and keys\n")
+		// perform necessary recovery operations on the file, recovering public and private key and ReplicatedLog
+		// test after keys are read from disk
+		privByte, err := newStore.GetPersonalKeysFromDisk()		
+
+		if err != nil {
+			panic("Failed to get our private key from disk.")
+		}
+		
+		c.Keys = crypto.NewKeysFromExistingBytes(privByte)
+	}
+
+	fmt.Println(&c.Keys)
+	return newStore
 }
 
 // helper method to read incoming messages from all the incoming connections
 func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string) {
 	reader := bufio.NewReader(connection)
 	for {
-		// TODO: receive incoming messages, identify the message type, demarshal into the appropriate data structure, and pass the struct to the appropriate channel for RAFT to handle
+		// Receive incoming messages, identify the message type, demarshal into the appropriate data structure, and pass the struct to the appropriate channel for RAFT to handle
 		bytes, err := reader.ReadBytes(MSG_DELIM)
 
 		if err != nil {
@@ -1060,6 +1073,7 @@ func (c *ClientInfo) recvIncomingMessages(connection net.Conn, clientName string
 }
 
 func (c *ClientInfo) reqChan(id Rpc, b []byte) {
+	// fmt.Printf("Enter\n")
 	switch id {
 	// If CANDIDATE, respond to the RequestVote result. Otherwise, ignore the request
 	case REQUESTVOTE_REPLY:
@@ -1096,9 +1110,9 @@ func (c *ClientInfo) reqChan(id Rpc, b []byte) {
 			c.CommandLogger.Printf("Client isn't leader, command [%+v] ignored\n", data)
 		}
 	}
+	// fmt.Printf("Exit\n")
 }
 
-// if minTime = 5, election timer lasts between 5 and 10 seconds
 func newElectionTimer(rand *rand.Rand, minTime time.Duration) (<-chan time.Time, time.Duration) {
 	extra := time.Duration(rand.Int63()) % minTime
 	return time.After(minTime + extra), minTime + extra
@@ -1165,15 +1179,69 @@ func (c *ClientInfo) Submit(command RawCommand) bool {
 
 // This function processes the command and generates the log entry. ASSUMPTION: happens under a mutex lock
 func (c *ClientInfo) handleRawCommand(command RawCommand) LogEntry {
-	// TODO: IAN - handle command, create a LogEntry struct and return it
+	getCommand := LogGetCommand{}
+	putCommand := LogPutCommand{}
+	createCommand := LogCreateCommand{}
+
+	// TODO: TODO recover LogEntry and currentTerm, votedFor, etc.
+	// Then, implement business logic and writing to disk for log, currentterm, and votedfor
+	// Tomorrow, implement faillink and fix link, hashing logEntry, and test recovering from disk
+	switch command.Action {
+	case CREATE:
+		createCommand.DictionaryId = fmt.Sprint(c.ProcessId) + DELIM + fmt.Sprint(c.NumDict)
+		
+		// generate public and private key for dictionary
+		dictKeys := crypto.NewKeys()
+		
+		// turn private/public key to bytes and encrypt with public key of member IDs
+		dictPrivKeyBytes := dictKeys.PrivKeyToByte()
+		dictPubKeyBytes := dictKeys.PubKeyToByte()
+
+		// make sure clientIds are unique
+		for _, memberId := range command.ClientIds {
+			pubKeyBytes, err := disk.GetPublicKeyFromDisk(memberId)
+
+			if err != nil {
+				panic(fmt.Sprintf("Failed to get public key of client %s from disk", memberId))	
+			}
+
+			pubKey := crypto.ByteToPubKey(pubKeyBytes)
+			encryptedPrivKey := crypto.Encrypt(dictPrivKeyBytes, pubKey)
+			createCommand.DictionaryPrivateKeys = append(createCommand.DictionaryPrivateKeys, encryptedPrivKey)
+			createCommand.MemberClientId = append(createCommand.MemberClientId, memberId)
+		}
+
+		createCommand.DictionaryPublicKey = dictPubKeyBytes
+	case GET:
+		getCommand.DictionaryId = command.DictionaryId
+
+		// encrypt with public key of dictionary that the request is for
+		dictPubKey, exists := c.StateMachine.GetPubKey(command.DictionaryId)
+		if !exists {
+			panic(fmt.Sprintf("Failed to get public key of dictionary with id: %s\n", command.DictionaryId))
+		}
+		getCommand.EncryptedKey = crypto.Encrypt([]byte(command.Key), dictPubKey)
+	case PUT:
+		putCommand.DictionaryId = command.DictionaryId
+
+		// encrypt with public key of the dictionary that the request is for
+		dictPubKey, exists := c.StateMachine.GetPubKey(command.DictionaryId)
+		if !exists {
+			panic(fmt.Sprintf("Failed to get public key of dictionary with id: %s\n", command.DictionaryId))
+		}
+		putCommand.EncryptedKeyValue = crypto.Encrypt([]byte(command.Key + DELIM + command.Value), dictPubKey)
+	}
+
+	// Handle command, create a LogEntry struct and return it
 	return LogEntry{
 		Term: c.CurrentTerm,
 		Action: command.Action,
 		CommandId: command.CommandId,
 
-		LogGetCommand: LogGetCommand{},
-		LogPutCommand: LogPutCommand{},
-		LogCreateCommand: LogCreateCommand{},
+		LogGetCommand: getCommand,
+		LogPutCommand: putCommand,
+		LogCreateCommand: createCommand,
+		SenderName: command.SenderName,
 	}
 }
 
