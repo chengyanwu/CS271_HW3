@@ -3,4 +3,5 @@ Henry Zhang
 
 ## Usage
 * `cd client`
-* `go run main.go [A-E]
+* `go run main.go [A-E]`
+* (we love our leader)
