@@ -7,6 +7,7 @@ import (
 	"example/users/client/crypto"
 
 	"bufio"
+	"encoding/binary"
 )
 
 const (
@@ -71,25 +72,69 @@ func (d *DiskStore) GetPersonalKeysFromDisk() ([]byte, error) {
 
 // Write our keys to the disk
 func (d *DiskStore) WritePersonalKeysToDisk(keys crypto.Keys) {
-	d.publicKeyFile.Write(append(keys.PubKeyToByte(), byte(d.Delim)))
-	d.privateKeyFile.Write(append(keys.PrivKeyToByte(), byte(d.Delim)))
+	_, err := d.publicKeyFile.Write(append(keys.PubKeyToByte(), byte(d.Delim)))
+
+	if err != nil {
+		fmt.Println(keys.PubKeyToByte())
+		panic("Error writing personal keys to disk.")
+	}
+	_, err = d.privateKeyFile.Write(append(keys.PrivKeyToByte(), byte(d.Delim)))
+
+	if err != nil {
+		fmt.Println(keys.PubKeyToByte())
+		panic("Error writing personal keys to disk.")
+	}
 }
 
-// func (d *DiskStore) GetLogFromDisk() ([]byte, error) {
+func (d *DiskStore) GetLogFromDisk() ([]byte, error) {
+	logBytes, err := os.ReadFile(d.raftLogFile.Name())
 
-// }
+	return logBytes, err
+}
 
-// func (d *DiskStore) AppendLogToDisk() {
+func (d *DiskStore) WriteLogToDisk(log []byte) {
+	d.raftLogFile.Truncate(0)
+	_, err := d.raftLogFile.WriteAt(log, 0)
 
-// }
+	if err != nil {
+		fmt.Println(err.Error())
+		panic("Error writing log to disk.")
+	}
+}
 
-// func (d *DiskStore) GetVarsFromDisk() ([]byte, []byte, error) {
+// Get currentTerm, votedFor from disk
+func (d *DiskStore) GetVarsFromDisk() (int, string, error) {
+	varReader := bufio.NewReader(d.raftVarFile)
 
-// }
+	currentTermBytes, err := varReader.ReadBytes(DELIM)
 
-// func (d *DiskStore) WriteVarsToDisk(currentTerm, votedFor int) {
-	
-// } 
+	if err != nil {
+		return 0, "", err
+	}
+
+	votedForBytes, err := varReader.ReadBytes(DELIM)
+
+	if err != nil {
+		return 0, "", err
+	}
+
+	currentTermBytes = currentTermBytes[:len(currentTermBytes) - 1]
+	votedForBytes = votedForBytes[:len(votedForBytes) - 1]
+	currentTerm := binary.LittleEndian.Uint16(currentTermBytes)
+	votedFor := string(votedForBytes)
+
+	return int(currentTerm), votedFor, nil
+}
+
+func (d *DiskStore) WriteVarsToDisk(currentTerm int, votedFor string) error {
+	currentTermByte := make([]byte, 2)
+	votedForByte := []byte(votedFor)
+	binary.LittleEndian.PutUint16(currentTermByte, uint16(currentTerm))
+	currentTermByte = append(currentTermByte, DELIM)
+	_, err := d.raftVarFile.WriteAt(append(append(currentTermByte, votedForByte...), DELIM), 0)
+
+	return err
+}
 
 func Exists(clientName string) bool {
 	publicKeyName := fmt.Sprintf("%s%s/%s.pub", PERSIST_DIR, PUBLIC_KEY_DIR, clientName)

@@ -14,10 +14,11 @@ type Dictionary struct {
 	Dict       map[string]string
 }
 
-func NewDict(id string, clientIDs []string, privKey *rsa.PrivateKey) Dictionary {
+func NewDict(id string, clientIDs []string, privKey *rsa.PrivateKey, pubKey *rsa.PublicKey) Dictionary {
 	return Dictionary {
 		DictId:    id,
 		ClientIds: clientIDs,
+		PublicKey: pubKey,
 		PrivateKey: privKey,
 		Dict:      make(map[string]string),
 	}
@@ -35,9 +36,9 @@ func (d *Dictionary) Get(key string) (string, bool) {
 
 func (d *Dictionary) String() string {
 	var ans string
-	for _, key := range d.Dict {
+	for key, val := range d.Dict {
 		ans += fmt.Sprintf("Key: %s", key)
-		ans += fmt.Sprintf("   Value: %s\n", d.Dict[key])
+		ans += fmt.Sprintf("   Value: %s\n", val)
 	}
 
 	return ans

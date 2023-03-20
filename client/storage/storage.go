@@ -15,12 +15,17 @@ type StringIntMap struct {
 
 type DictofDicts struct {
 	mu sync.Mutex
-	m map[string]*dictionary.Dictionary
+	m map[string]*dictionary.Dictionary // dictionary_id
 }
 
 type ConnStorage struct {
 	mu sync.Mutex
 	m  map[string]net.Conn
+}
+
+type Faillinks struct {
+	mu sync.Mutex
+	m  map[string]bool
 }
 
 func NewDictofDicts() DictofDicts {
@@ -30,12 +35,12 @@ func NewDictofDicts() DictofDicts {
 	}
 }
 
-// Creates a new dictionary in the state machine
-func (d *DictofDicts) NewDict(dictionary_id string, clientIDs []string, privKey *rsa.PrivateKey) bool {
+// Creates a new dictionary in the state machine!
+func (d *DictofDicts) NewDict(dictionary_id string, clientIDs []string, privKey *rsa.PrivateKey, pubKey *rsa.PublicKey) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if _, exists := d.m[dictionary_id]; !exists {
-		newDict := dictionary.NewDict(dictionary_id, clientIDs, privKey)
+		newDict := dictionary.NewDict(dictionary_id, clientIDs, privKey, pubKey)
 		d.m[dictionary_id] = &newDict
 
 		return true // new dictionary is created
@@ -92,6 +97,19 @@ func (d *DictofDicts) GetPubKey(dictionary_id string) (*rsa.PublicKey, bool) {
 	return nil, false
 }
 
+func (d *DictofDicts) GetPrivKey(dictionary_id string) (*rsa.PrivateKey, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, exists := d.m[dictionary_id]; exists {
+		ans := d.m[dictionary_id].PrivateKey
+
+		return ans, true
+	}
+	
+	return nil, false
+}
+
 func (d *DictofDicts) GetClientIds(dictionary_id string) ([]string, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -118,6 +136,7 @@ func (d *DictofDicts) PrintDict(dictionary_id string) (string, bool) {
 	return "", false
 }
 
+// Gets the member dictionaries of the client
 func (d *DictofDicts) GetMemberDictionaries(clientName string) []string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -196,4 +215,29 @@ func (ms *ConnStorage) Keys(all bool) []string {
     }
 
 	return keys
+}
+
+func (f *Faillinks) Init() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.m = make(map[string]bool)
+	f.m["A"] = false	
+	f.m["B"] = false
+	f.m["C"] = false
+	f.m["D"] = false
+	f.m["E"] = false
+}
+
+func (f *Faillinks) Set(key string, value bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.m[key] = value
+}
+
+func (f *Faillinks) Get(key string) (bool, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, found := f.m[key]
+
+	return v, found
 }

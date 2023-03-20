@@ -32,7 +32,7 @@ var port string
 var processId int64
 var clientInfoMu sync.Mutex
 var leaderInfoMutex sync.Mutex
-var commitChan chan struct{}
+var commitChan chan string
 
 func main() {
 	processId = int64(os.Getpid())
@@ -56,7 +56,7 @@ func main() {
 
 // init server with default configuration and connect to other servers
 func serverInit() {
-	commitChan = make(chan struct{})
+	commitChan = make(chan string, 1000)
 
 	// Creates a new RAFT and perform recovery
 	myInfo.NewRaft(processId, os.Args[1], &clientInfoMu, &leaderInfoMutex, commitChan)
@@ -183,9 +183,9 @@ func establishConnection(clientPort string) net.Conn {
 
 func takeUserInput() {
 	// var action string
-	commandIndex := 0
+	commandIndex := len(myInfo.ReplicatedLog)
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Println("===== Actions =====\np - print client info\n===================")
+	fmt.Println("===== Actions =====\np - print client info\ncreate - creates a new dictionary with given members (A-E)\nget - get a key's value from dictionary with given id\nput - add a key-value pair to dictionary with given id\nprintDict - prints out information for dictionary with given id\nprintAll - print out the ids of all dictionaries we are a member of\nfailLink - fails a link between self and another process\nfixLink - fixes a link between self and another process with an existing failed link\nfailProcess - fails our process\n===================")
 	for {
 		var command client.RawCommand
 		action, err := reader.ReadString('\n')
@@ -289,7 +289,7 @@ func takeUserInput() {
 
 				fmt.Println("===================================")
 				fmt.Printf("Client IDs: %+v\n", clientIds)
-				fmt.Printf("Dict Content:\n %+v", dictContent)
+				fmt.Printf("Dict Content:\n%+v", dictContent)
 				fmt.Println("===================================")
 			} else {
 				fmt.Println("=====================================")
@@ -299,8 +299,9 @@ func takeUserInput() {
 			continue
 		} else if split[0] == "printAll" {
 			fmt.Println("====================================")
+			// return all the member dictionaries of the current state machine
 			memberDicts := myInfo.StateMachine.GetMemberDictionaries(myInfo.ClientName) 
-			if len(memberDicts) == 0 {
+			if len(memberDicts) > 0 {
 				fmt.Println("Members: ", memberDicts)
 			} else {
 				fmt.Println("There are no dictionaries that we are a member of")
@@ -308,13 +309,34 @@ func takeUserInput() {
 			fmt.Println("====================================")	
 			continue
 		} else if split[0] == "failLink" {
-			fmt.Println("TODO")
+			if len(split) < 2 {
+				fmt.Println("USAGE: failLink <A-E>")
+			}
+
+			link := split[1]
+
+			if link != myInfo.ClientName {
+				myInfo.Faillinks.Set(link, true)
+			} else {
+				fmt.Println("Can't fail ourself :(")
+			}
 			continue
 		} else if split[0] == "fixLink" {
-			fmt.Println("TODO")	
+			if len(split) < 2 {
+				fmt.Println("USAGE: fixLink <A-E>")
+			}
+
+			link := split[1]
+
+			if link != myInfo.ClientName {
+				myInfo.Faillinks.Set(link, false)
+			} else {
+				fmt.Println("Can't fix ourself :(")
+			}
 			continue
 		} else if split[0] == "failProcess" {
-			fmt.Println("TODO")
+			myInfo.DiskStore.CloseFDs()
+			os.Exit(0)
 			continue
 		} else {
 			fmt.Println("Invalid action:", action)
@@ -328,8 +350,10 @@ func takeUserInput() {
 		for commit := false; !commit; {
 			// fmt.Println("In loop")
 			select {
-			case <- commitChan:
-				commit = true
+			case id := <- commitChan:
+				if id == command.CommandId {
+					commit = true
+				}
 			case <- timer:
 				// timeout, send request again
 				sendCommand(command)
