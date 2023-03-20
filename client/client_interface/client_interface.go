@@ -26,6 +26,8 @@ type Role uint8
 type Action uint8
 type Rpc uint8
 
+var repeated map[string]int
+
 const (
 	FOLLOWER Role = iota
 	LEADER
@@ -52,6 +54,7 @@ const (
 	DELIM     = "*" // Delimiter separating action from data in incoming TCP requests
 	TIMEOUT   = 10
 	MAJORITY  = 3
+	SENTINEL  = -2
 )
 
 // implement ToString
@@ -212,6 +215,7 @@ type AppendEntryResponse struct {
 	Success     bool // true if previous entries of FOLLOWER were all committed
 	ClientName  string
 	EntryLength int
+	RepeatFail  bool // true if the request fails and the same request has been seen previously
 }
 
 // Raw commands represent commands sent by the clients over the network, before encryption occurs.
@@ -379,6 +383,13 @@ func (c *ClientInfo) NewRaft(processID int64, name string, clientMu *sync.Mutex,
 	c.Mu = clientMu
 
 	c.Faillinks.Init()
+
+	repeated = make(map[string]int)
+	repeated["A"] = SENTINEL
+	repeated["B"] = SENTINEL
+	repeated["C"] = SENTINEL
+	repeated["D"] = SENTINEL
+	repeated["E"] = SENTINEL
 
 	c.DiskLogger = log.New(os.Stdout, "[FSM]", log.LstdFlags)
 	c.ElecLogger = log.New(os.Stdout, "[ELEC/AE]", log.LstdFlags)
@@ -693,7 +704,7 @@ func (c *ClientInfo) follower() {
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 
 				// process Logs
-				c.processAE(request, &responseData)	
+				c.processAE(request, &responseData, request.LeaderName)	
 			// LEADER is more up to date than us
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, updating our term\n", request.Term, currentTerm)
@@ -707,7 +718,7 @@ func (c *ClientInfo) follower() {
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 
 				// process Logs
-				c.processAE(request, &responseData)
+				c.processAE(request, &responseData, request.LeaderName)
 			}
 
 			c.persistState(2)
@@ -723,10 +734,16 @@ func (c *ClientInfo) follower() {
 }
 
 // Update our log, handle the AppendEntries RPC
-func (c *ClientInfo) processAE(request AppendEntryRequest, responseData *AppendEntryResponse) {
+func (c *ClientInfo) processAE(request AppendEntryRequest, responseData *AppendEntryResponse, leaderId string) {
+	repeatedIndex := request.PrevLogIndex == repeated[leaderId]
+
+	repeated[leaderId] = request.PrevLogIndex
+	responseData.RepeatFail = false
+
 	// Return failure if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm - need to move prevLogIndex back by 1
 	if request.PrevLogIndex == -1 || (request.PrevLogIndex < len(c.ReplicatedLog) && request.PrevLogTerm == c.ReplicatedLog[request.PrevLogIndex].Term) {
 		responseData.Success = true
+		repeated[leaderId] = SENTINEL // reset on success
 
 		// Find insertion point of passed log to replicate
 		insertIndex := request.PrevLogIndex + 1
@@ -752,6 +769,10 @@ func (c *ClientInfo) processAE(request AppendEntryRequest, responseData *AppendE
 			responseData.EntryLength = len(request.Entries)
 		} else {
 			responseData.EntryLength = 0 // Don't update the next send's state machine if nothing was replicated
+
+			if repeatedIndex {
+				responseData.RepeatFail = true
+			}
 		}
 
 		// Advance state machine with newly committed entries, if any
@@ -859,7 +880,7 @@ func (c *ClientInfo) candidate() {
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
 
-				c.processAE(request, &responseData)
+				c.processAE(request, &responseData, request.LeaderName)
 			// LEADER is more up to date than us, become FOLLOWER
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, stepping down\n", request.Term, tmpTerm)
@@ -873,7 +894,7 @@ func (c *ClientInfo) candidate() {
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
 
-				c.processAE(request, &responseData)
+				c.processAE(request, &responseData, request.LeaderName)
 			}
 
 			c.persistState(2)
@@ -998,7 +1019,7 @@ func (c *ClientInfo) leader() {
 					}
 				} else {
 					 // again, nextIndex represents the "unique value" that hasn't been overwritten by the log
-					if nextIndex > 0 {
+					if nextIndex > 0 && !reply.RepeatFail {
 						c.NextIndex.Set(reply.ClientName, nextIndex - 1) // decrease it by one, see if we can apply our log by one more entry the next time
 					}
 					
@@ -1058,7 +1079,7 @@ func (c *ClientInfo) leader() {
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
 
-				c.processAE(request, &responseData)
+				c.processAE(request, &responseData, request.LeaderName)
 			// LEADER is more up to date than us, become FOLLOWER
 			} else {
 				c.ElecLogger.Printf("LEADER's term=%d is more up-to-date than our term=%d, stepping down\n", request.Term, tmpTerm)
@@ -1072,7 +1093,7 @@ func (c *ClientInfo) leader() {
 				c.CurrentLeader.setLeader(request.LeaderName, conn)
 				c.setRole(FOLLOWER)
 
-				c.processAE(request, &responseData) // We have to append entries to the log, if entries are sent
+				c.processAE(request, &responseData, request.LeaderName) // We have to append entries to the log, if entries are sent
 			}
 
 			c.persistState(2)
