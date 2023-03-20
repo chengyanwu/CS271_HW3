@@ -1,3 +1,6 @@
 # CS271_HW3
 Henry Zhang
-Ian Wu
+
+## Usage
+* `cd client`
+* `go run main.go [A-E]
